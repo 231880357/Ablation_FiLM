@@ -1,0 +1,45 @@
+# Conda environment for Ablation_FiLM.
+#
+# Create the environment:
+#   conda env create -f environment.yml
+#   conda activate ablation_film
+#
+# This project builds a custom CUDA extension for pointnet2. After activating
+# the environment, make sure `nvcc --version` works on the remote host, then run:
+#   pip install -v ./pointnet2/lib
+#
+# If the remote host uses a different CUDA runtime, adjust `pytorch-cuda`
+# below to match the installed NVIDIA driver/toolkit, such as 11.8 or 12.1.
+name: ablation_film
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.9
+  - pip>=23
+  - setuptools
+  - wheel
+  - ninja
+  - cmake
+
+  # Core deep learning stack.
+  - pytorch=2.1.*
+  - pytorch-cuda=11.8
+
+  # Numeric and scientific computing.
+  - numpy<2
+  - scipy
+  - scikit-learn
+
+  # Runtime utilities.
+  - tqdm
+  - pyyaml
+  - yacs
+
+  # Geometry/topology packages used by dataset.py and topology.py.
+  - open3d
+  - ripser
