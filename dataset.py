@@ -1,4 +1,5 @@
 import os
+import glob
 import numpy as np
 import torch
 import torch.utils.data
@@ -45,6 +46,43 @@ def _compose_input_features(pcd_src, pcd_tgt, topo_feat_src, topo_feat_tgt, use_
 
     dummy_topo = np.zeros(1, dtype=np.float32)
     return pcd_src, pcd_tgt, dummy_topo, dummy_topo
+
+
+def _normalize_kitti_sequence_ids(sequence_ids):
+    normalized = []
+    for sequence_id in sequence_ids or []:
+        value = str(sequence_id).strip()
+        if value.isdigit():
+            value = f'{int(value):02d}'
+        if value and value not in normalized:
+            normalized.append(value)
+    return normalized
+
+
+def _find_kitti_sequence_files(kitti_root, sequence_id):
+    candidate_dirs = [
+        os.path.join(kitti_root, 'sequences', sequence_id, 'velodyne'),
+        os.path.join(kitti_root, sequence_id, 'velodyne'),
+        os.path.join(kitti_root, sequence_id),
+    ]
+    files = []
+    visited_dirs = set()
+    for candidate_dir in candidate_dirs:
+        absolute_dir = os.path.abspath(candidate_dir)
+        if absolute_dir in visited_dirs:
+            continue
+        visited_dirs.add(absolute_dir)
+        files.extend(glob.glob(os.path.join(absolute_dir, '*.bin')))
+    return sorted(set(files))
+
+
+def _split_kitti_files(files, split):
+    split_idx = int(len(files) * 0.8)
+    if split == 'train':
+        return files[:split_idx]
+    if split == 'val':
+        return files[split_idx:]
+    raise NotImplementedError()
 
 
 class _TopologyCacheMixin:
@@ -294,19 +332,36 @@ class KittiDataset(_TopologyCacheMixin, torch.utils.data.Dataset):
         self._init_topology_cache(cfg, f'{split}_kitti')
 
         if hasattr(args, 'kitti_root') and args.kitti_root:
-            self.kitti_root = args.kitti_root
+            self.kitti_root = os.path.abspath(os.path.expanduser(args.kitti_root))
         else:
-            self.kitti_root = '../mmdetection3d/data/kitti/training/velodyne'
+            self.kitti_root = os.path.abspath('../mmdetection3d/data/kitti/training/velodyne')
 
-        import glob
-        all_files = sorted(glob.glob(os.path.join(self.kitti_root, '*.bin')))
-        split_idx = int(len(all_files) * 0.8)
-        if split == 'train':
-            self.file_list = all_files[:split_idx]
-        elif split == 'val':
-            self.file_list = all_files[split_idx:]
+        self.sequence_ids = _normalize_kitti_sequence_ids(
+            getattr(args, 'kitti_sequences', None)
+        )
+        if self.sequence_ids:
+            self.file_list = []
+            missing_sequences = []
+            for sequence_id in self.sequence_ids:
+                sequence_files = _find_kitti_sequence_files(self.kitti_root, sequence_id)
+                if not sequence_files:
+                    missing_sequences.append(sequence_id)
+                    continue
+                self.file_list.extend(_split_kitti_files(sequence_files, split))
+
+            if missing_sequences:
+                missing = ', '.join(missing_sequences)
+                raise FileNotFoundError(
+                    f'No KITTI odometry .bin files found for sequence(s) {missing} '
+                    f'under {self.kitti_root}'
+                )
+            print(
+                f"KITTI {split}: sequences={','.join(self.sequence_ids)}, "
+                f'files={len(self.file_list)}'
+            )
         else:
-            raise NotImplementedError()
+            all_files = sorted(glob.glob(os.path.join(self.kitti_root, '*.bin')))
+            self.file_list = _split_kitti_files(all_files, split)
 
         if len(self.file_list) == 0:
             print(f"Warning: No bin files found in {self.kitti_root}")
@@ -329,7 +384,8 @@ class KittiDataset(_TopologyCacheMixin, torch.utils.data.Dataset):
         lm_src = pcd_src.copy()
         lm_tgt = pcd_tgt.copy()
 
-        cache_key = f"kitti_{os.path.splitext(os.path.basename(file_path))[0]}"
+        relative_path = os.path.relpath(file_path, self.kitti_root)
+        cache_key = f"kitti_{os.path.splitext(relative_path)[0]}"
         topo_feat_src = self._get_cached_topology(
             cache_key, pcd_src, self.topo_dim, os.path.basename(file_path)
         )

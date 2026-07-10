@@ -9,6 +9,27 @@ from dataset import Lung250MDataset, KittiDataset
 from ppwc import Topo9_PointPWC, multiScaleLoss, topo_pyramid_loss
 
 
+def _cuda_memory_stats(device):
+    torch.cuda.synchronize(device)
+    mib = 1024 ** 2
+    return {
+        'allocated': torch.cuda.memory_allocated(device) / mib,
+        'reserved': torch.cuda.memory_reserved(device) / mib,
+        'peak_allocated': torch.cuda.max_memory_allocated(device) / mib,
+        'peak_reserved': torch.cuda.max_memory_reserved(device) / mib,
+    }
+
+
+def _print_cuda_memory(prefix, device):
+    stats = _cuda_memory_stats(device)
+    print(
+        f"{prefix}: allocated={stats['allocated']:.1f} MiB, "
+        f"reserved={stats['reserved']:.1f} MiB, "
+        f"peak_allocated={stats['peak_allocated']:.1f} MiB, "
+        f"peak_reserved={stats['peak_reserved']:.1f} MiB"
+    )
+
+
 def train(cfg, args):
     root = cfg.BASE_DIRECTORY
     exp_name = cfg.EXPERIMENT_NAME
@@ -64,21 +85,34 @@ def train(cfg, args):
         else:
             train_set.file_list = train_set.file_list[:8]
     train_loader = DataLoader(train_set, shuffle=True, drop_last=True, **dataloader_kwargs)
-    
-    if getattr(args, 'dataset', 'lung') == 'kitti':
-        val_set = KittiDataset(cfg, args, phase='test', split='val')
+
+    vram_test = bool(getattr(args, 'vram_test', False))
+    if vram_test:
+        if not device.startswith('cuda') or not torch.cuda.is_available():
+            raise RuntimeError('VRAM test requires a CUDA device')
+        val_loader = None
+        torch.cuda.reset_peak_memory_stats(device)
+        print(
+            f"VRAM test on {torch.cuda.get_device_name(device)}: "
+            f'batch_size={batch_size}, steps={args.vram_test_steps}'
+        )
+        _print_cuda_memory('VRAM baseline', device)
     else:
-        val_set = Lung250MDataset(cfg, args, phase='test', split='val')
-    if args.debug:
-        if hasattr(val_set, 'case_list'):
-            val_set.case_list = val_set.case_list[:8]
+        if getattr(args, 'dataset', 'lung') == 'kitti':
+            val_set = KittiDataset(cfg, args, phase='test', split='val')
         else:
-            val_set.file_list = val_set.file_list[:8]
-    val_loader = DataLoader(val_set, shuffle=False, drop_last=False, **dataloader_kwargs)
+            val_set = Lung250MDataset(cfg, args, phase='test', split='val')
+        if args.debug:
+            if hasattr(val_set, 'case_list'):
+                val_set.case_list = val_set.case_list[:8]
+            else:
+                val_set.file_list = val_set.file_list[:8]
+        val_loader = DataLoader(val_set, shuffle=False, drop_last=False, **dataloader_kwargs)
 
     # logging
     validation_log = np.zeros([num_epochs, 3])
 
+    completed_train_steps = 0
     for ep in range(1, num_epochs + 1):
         print('Started epoch {}/{}'.format(ep, num_epochs))
         model.train()
@@ -121,6 +155,16 @@ def train(cfg, args):
             
             scaler.step(optimizer)
             scaler.update()
+
+            if vram_test:
+                completed_train_steps += 1
+                _print_cuda_memory(f'VRAM step {completed_train_steps}', device)
+                if completed_train_steps >= args.vram_test_steps:
+                    print(
+                        'VRAM test complete. No validation or checkpoint was run; '
+                        'peak values above include forward, backward, and optimizer state.'
+                    )
+                    return
 
         train_loss = np.mean(loss_values)
         validation_log[ep - 1, 0] = train_loss
@@ -185,12 +229,25 @@ if __name__ == "__main__":
                         help="dataset to use")
     parser.add_argument('--kitti_root', default='../mmdetection3d/data/kitti/training/velodyne',
                         help="folder containing kitti bin files")
+    parser.add_argument('--kitti_sequences', nargs='+', default=None,
+                        help='KITTI odometry sequence IDs, for example: 00 01')
     parser.add_argument('--batch_size', type=int, default=None,
                         help='override batch size from config')
     parser.add_argument('--num_workers', type=int, default=None,
                         help='override num_workers from config')
+    parser.add_argument('--vram_test', action='store_true',
+                        help='run a short KITTI odometry 00/01 training VRAM test')
+    parser.add_argument('--vram_test_steps', type=int, default=10,
+                        help='number of optimizer steps for --vram_test')
 
     args = parser.parse_args()
+
+    if args.vram_test:
+        if args.dataset != 'kitti':
+            parser.error('--vram_test requires --dataset kitti')
+        if args.vram_test_steps < 1:
+            parser.error('--vram_test_steps must be at least 1')
+        args.kitti_sequences = ['00', '01']
 
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
