@@ -435,9 +435,10 @@ class TopoCoupledPointConvD_v2(nn.Module):
         self.gamma_gen = nn.Linear(64, out_channel)
         self.beta_gen = nn.Linear(64, out_channel)
         
-        # Initialize FiLM to identity (gamma=1, beta=0)
+        # ``forward`` applies (1 + gamma) * x + beta, so identity requires
+        # gamma=0 and beta=0 at initialization.
         nn.init.zeros_(self.gamma_gen.weight)
-        nn.init.ones_(self.gamma_gen.bias)
+        nn.init.zeros_(self.gamma_gen.bias)
         nn.init.zeros_(self.beta_gen.weight)
         nn.init.zeros_(self.beta_gen.bias)
     

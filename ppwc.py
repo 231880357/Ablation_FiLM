@@ -2,7 +2,8 @@
 Topo9: Original Topo + L4-only Sparse Residual Topology Coupling
 - Level 0: Conv1d(3 + topo_dim, 32)  (same as original Topo)
 - Level 1-3: Standard PointConvD      (same as original Topo)
-- Level 4:   TopoCoupledPointConvD_v2 (only topology coupling point)
+- Level 4:   TopoCoupledPointConvD_v2 when topology is enabled;
+             standard PointConvD otherwise
 - Cost Volume & Flow Estimator: same as original Topo
 """
 
@@ -28,7 +29,7 @@ class Topo9_PointPWC(nn.Module):
         topo_dim = cfg.MODEL.TOPO_FEAT_DIM
         
         self.use_topo = topo_dim > 0
-        self.topo_dim = topo_dim if self.use_topo else 6
+        self.topo_dim = topo_dim
         
         if self.use_topo:
             assert topo_dim == 6, f"Expected topo_dim=6, got {topo_dim}"
@@ -61,11 +62,15 @@ class Topo9_PointPWC(nn.Module):
         self.level3_0 = Conv1d(256, 256)
         self.level3_1 = Conv1d(256, 512)
 
-        # l4: 64 (L4-only topology coupling)
-        self.level4 = TopoCoupledPointConvD_v2(
-            64, feat_nei, 512 + 3, 256, topo_dim=self.topo_dim,
-            use_bn=True, residual_scale=1.0
-        )
+        # l4: 64. Disabling topology restores the baseline PointConvD rather
+        # than retaining a FiLM block driven by a dummy zero vector.
+        if self.use_topo:
+            self.level4 = TopoCoupledPointConvD_v2(
+                64, feat_nei, 512 + 3, 256, topo_dim=self.topo_dim,
+                use_bn=True, residual_scale=1.0
+            )
+        else:
+            self.level4 = PointConvD(64, feat_nei, 512 + 3, 256)
 
         # deconv
         self.deconv4_3 = Conv1d(256, 64)
@@ -80,14 +85,9 @@ class Topo9_PointPWC(nn.Module):
         self.upsample = UpsampleFlow()
 
     def forward(self, xyz1, xyz2, color1, color2, topo1=None, topo2=None):
-        B, N, _ = xyz1.shape
-        
         if self.use_topo:
             if topo1 is None or topo2 is None:
                 raise ValueError(f"Topology required. Got topo1={topo1 is not None}, topo2={topo2 is not None}")
-        else:
-            topo1 = torch.zeros(B, self.topo_dim, device=xyz1.device, dtype=xyz1.dtype)
-            topo2 = torch.zeros(B, self.topo_dim, device=xyz2.device, dtype=xyz2.dtype)
 
         # l0
         pc1_l0 = xyz1.permute(0, 2, 1)
@@ -129,12 +129,18 @@ class Topo9_PointPWC(nn.Module):
         feat2_l3_4 = self.level3_0(feat2_l3)
         feat2_l3_4 = self.level3_1(feat2_l3_4)
 
-        # l4 (topology coupling only here)
-        pc1_l4, feat1_l4, _ = self.level4(pc1_l3, feat1_l3_4, topo1)
+        # l4 (topology coupling only when explicitly enabled)
+        if self.use_topo:
+            pc1_l4, feat1_l4, _ = self.level4(pc1_l3, feat1_l3_4, topo1)
+        else:
+            pc1_l4, feat1_l4, _ = self.level4(pc1_l3, feat1_l3_4)
         feat1_l4_3 = self.upsample(pc1_l3, pc1_l4, feat1_l4)
         feat1_l4_3 = self.deconv4_3(feat1_l4_3)
 
-        pc2_l4, feat2_l4, _ = self.level4(pc2_l3, feat2_l3_4, topo2)
+        if self.use_topo:
+            pc2_l4, feat2_l4, _ = self.level4(pc2_l3, feat2_l3_4, topo2)
+        else:
+            pc2_l4, feat2_l4, _ = self.level4(pc2_l3, feat2_l3_4)
         feat2_l4_3 = self.upsample(pc2_l3, pc2_l4, feat2_l4)
         feat2_l4_3 = self.deconv4_3(feat2_l4_3)
 
