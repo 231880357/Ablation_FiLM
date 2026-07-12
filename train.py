@@ -141,7 +141,12 @@ def train(cfg, args):
         loss_values = []
         start_time = time.time()
 
-        lambda_topo = 0.01  # Auxiliary topology consistency loss weight
+        # The lung source/target clouds are independently sampled and shuffled, so
+        # equal indices do not identify corresponding anatomical points.  The
+        # current topology loss compares pairwise-distance matrices by index and
+        # therefore supplies an invalid training signal for this dataset.  Keep it
+        # disabled until it is replaced by a correspondence-invariant objective.
+        lambda_topo = 0.0
         
         train_bar = tqdm(train_loader, desc=f"Epoch {ep}/{num_epochs} [train]", leave=False)
         for it, data in enumerate(train_bar, 1):
@@ -159,8 +164,13 @@ def train(cfg, args):
                     pcd_src, pcd_tgt, color_src, color_tgt, topo_src, topo_tgt
                 )
                 loss_flow = multiScaleLoss(pred_flows, gt_flow, fps_pc1_idxs)
-                loss_topo = topo_pyramid_loss(pcd_src, pcd_tgt, pred_flows[0], k=20)
-                loss = loss_flow + lambda_topo * loss_topo
+                if lambda_topo > 0.0:
+                    loss_topo = topo_pyramid_loss(pcd_src, pcd_tgt, pred_flows[0], k=20)
+                    loss = loss_flow + lambda_topo * loss_topo
+                else:
+                    # Avoid allocating two [B, N, N] distance matrices when the
+                    # invalid auxiliary objective is disabled.
+                    loss = loss_flow
 
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"WARNING: NaN/Inf loss at iteration {it}, skipping batch")
