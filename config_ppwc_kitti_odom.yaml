@@ -1,7 +1,7 @@
 BASE_DIRECTORY: 'train_out_kitti_odom'
 EXPERIMENT_NAME: 'topo9_kitti_odom'
-NUM_WORKERS: 2
-USE_AMP: True
+NUM_WORKERS: 4
+USE_AMP: False
 DEVICE: 'cuda'
 DATA:
   PIN_MEMORY: True
@@ -14,8 +14,8 @@ MODEL:
   PPWC_SFPC_BN: False
   TOPO_FEAT_DIM: 6
 SOLVER:
-  BATCH_SIZE: 1
-  NUM_EPOCHS: 60
+  BATCH_SIZE: 4
+  NUM_EPOCHS: 30
   LEARNING_RATE: 0.001
   SCHEDULER: 'multistep'
   LR_LAMBDA: 0.1

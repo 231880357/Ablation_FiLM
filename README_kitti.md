@@ -27,28 +27,13 @@ python -X utf8 test_kitti_odometry.py `
 执行一个训练 step 和一个验证 batch，并保存测试 checkpoint：
 
 ```powershell
-python -X utf8 train.py `
-  --dataset kitti_odom `
-  --odom-root D:\kitti_odometry `
-  --odom-train-seqs 00 `
-  --odom-val-seqs 08 `
-  --odom-max-pairs 4 `
-  --max-train-steps 1 `
-  --max-val-steps 1 `
-  --batch_size 1 `
-  --num_workers 0 `
-  --config config_ppwc_kitti_odom.yaml `
-  --gpu 0
+python -X utf8 train.py --dataset kitti_odom --odom-root ../kitti_odometry --odom-train-seqs 00 --odom-val-seqs 08 --odom-max-pairs 4 --max-train-steps 1 --max-val-steps 1 --batch_size 1 --num_workers 0 --config config_ppwc_kitti_odom.yaml --gpu 1
 ```
 
 正式训练：
 
 ```powershell
-python -X utf8 train.py `
-  --dataset kitti_odom `
-  --odom-root D:\kitti_odometry `
-  --config config_ppwc_kitti_odom.yaml `
-  --gpu 0
+python -X utf8 train.py --dataset kitti_odom --odom-root ../kitti_odometry --config config_ppwc_kitti_odom.yaml --gpu 1
 ```
 
 对 sequence 00 的前三个 pair 推理：

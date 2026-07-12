@@ -42,6 +42,7 @@ topo_cache/
 *.pt
 *.pth
 *.ckpt
+*.log
 
 # Local datasets
 data/

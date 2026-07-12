@@ -158,7 +158,7 @@ class Lung250MDataset(_TopologyCacheMixin, torch.utils.data.Dataset):
         else:
             self.pcd_template = os.path.join(args.cloudfolder_val, 'case_{:03d}_{}.pth')
             self.gt_template = os.path.join(args.supfolder_val, 'case_{:03d}.pth')
-        self.idx_16k = torch.load('../ind_16384_train.pth', map_location='cpu')
+        self.idx_16k = torch.load('ind_16384_train.pth', map_location='cpu')
 
         if split == 'train':
             val_cases = np.array([2, 8, 54, 55, 56, 94, 97])
