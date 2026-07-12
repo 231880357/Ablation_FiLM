@@ -3,7 +3,7 @@ from sklearn.neighbors import kneighbors_graph
 from scipy.sparse.csgraph import dijkstra
 from ripser import ripser
 
-def compute_topo_features(pcd):
+def compute_topo_features(pcd, seed=0):
     """
     Computes topological features (persistent homology) for a point cloud using Manifold distance.
     Returns a 1D numpy array of features.
@@ -14,7 +14,8 @@ def compute_topo_features(pcd):
     N = pcd.shape[0]
     target_N = 500
     if N > target_N:
-        idx = np.random.choice(N, target_N, replace=False)
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(N, target_N, replace=False)
         sub_pcd = pcd[idx]
     else:
         sub_pcd = pcd

@@ -36,6 +36,9 @@ outputs/
 results/
 wandb/
 tensorboard/
+train_out*/
+prediction*/
+topo_cache/
 *.pt
 *.pth
 *.ckpt

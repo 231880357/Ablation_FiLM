@@ -1,14 +1,23 @@
 import argparse
+import json
 import os
 import numpy as np
 import glob
 
 from defaults import get_cfg_defaults
-from ppwc import Topo9_PointPWC
-try:
-    from topology import compute_topo_features
-except ImportError:
-    compute_topo_features = None
+from kitti_odometry_utils import (
+    build_odometry_pairs,
+    deterministic_sample,
+    load_calibration_transform,
+    load_pose_matrices,
+    load_velodyne_points,
+    nearest_neighbor_mean,
+    relative_velodyne_transform,
+    transform_points,
+    transform_summary,
+)
+
+compute_topo_features = None
 
 
 def prepare_topology_inputs(pcd_src, pcd_tgt, topo_dim, device):
@@ -44,6 +53,99 @@ def prepare_topology_inputs(pcd_src, pcd_tgt, topo_dim, device):
     return color_src, color_tgt, topo_src, topo_tgt
 
 
+def run_kitti_odometry_inference(args, cfg, model, device, use_amp):
+    pairs = build_odometry_pairs(
+        args.odom_root,
+        args.seqs,
+        gap=args.gap,
+        require_poses=False,
+        start=args.start,
+        count_per_sequence=args.count,
+    )
+    if not pairs:
+        raise RuntimeError('No KITTI odometry inference pairs were found')
+
+    sequence_cache = {}
+    norm_factor = cfg.INPUT.SCALE_NORM_FACTOR
+    for pair in pairs:
+        src_full = load_velodyne_points(pair.src_bin)
+        tgt_full = load_velodyne_points(pair.tgt_bin)
+        src_np, _ = deterministic_sample(
+            src_full,
+            args.odom_num_points,
+            f'{pair.sequence}:{pair.src_idx}:src',
+            args.odom_seed,
+        )
+        tgt_np, _ = deterministic_sample(
+            tgt_full,
+            args.odom_num_points,
+            f'{pair.sequence}:{pair.tgt_idx}:tgt',
+            args.odom_seed,
+        )
+
+        target_mean = np.mean(tgt_np, axis=0)
+        pcd_src = torch.from_numpy((src_np - target_mean) / norm_factor).float().unsqueeze(0).to(device)
+        pcd_tgt = torch.from_numpy((tgt_np - target_mean) / norm_factor).float().unsqueeze(0).to(device)
+        color_src, color_tgt, topo_src, topo_tgt = prepare_topology_inputs(
+            pcd_src, pcd_tgt, cfg.MODEL.TOPO_FEAT_DIM, device
+        )
+
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.no_grad():
+                pred_flows, _, _, _, _ = model(
+                    pcd_src, pcd_tgt, color_src, color_tgt, topo_src, topo_tgt
+                )
+                pred_flow = pred_flows[0].permute(0, 2, 1)[0].float().cpu().numpy()
+
+        pred_flow *= norm_factor
+        registered_src = src_np + pred_flow
+        output_columns = [registered_src, src_np]
+        metrics = {
+            'sequence': pair.sequence,
+            'source_frame': pair.src_idx,
+            'target_frame': pair.tgt_idx,
+            'source_points': int(len(src_np)),
+            'target_points': int(len(tgt_np)),
+            'pose_available': bool(pair.has_pose),
+            'gap': args.gap,
+            'sample_seed': args.odom_seed,
+            'original_to_target_nn': nearest_neighbor_mean(src_np, tgt_np),
+            'model_registered_to_target_nn': nearest_neighbor_mean(registered_src, tgt_np),
+        }
+
+        if pair.has_pose:
+            if pair.sequence not in sequence_cache:
+                sequence_cache[pair.sequence] = (
+                    load_calibration_transform(pair.calib_path),
+                    load_pose_matrices(pair.pose_path),
+                )
+            calib_transform, poses = sequence_cache[pair.sequence]
+            relative_transform = relative_velodyne_transform(
+                calib_transform, poses, pair.src_idx, pair.tgt_idx
+            )
+            pose_aligned_src = transform_points(src_np, relative_transform)
+            output_columns.append(pose_aligned_src)
+            translation, rotation_degrees = transform_summary(relative_transform)
+            metrics.update(
+                {
+                    'relative_translation': translation,
+                    'relative_rotation_degrees': rotation_degrees,
+                    'pose_aligned_to_target_nn': nearest_neighbor_mean(pose_aligned_src, tgt_np),
+                    'model_to_pose_epe': float(
+                        np.linalg.norm(registered_src - pose_aligned_src, axis=1).mean()
+                    ),
+                }
+            )
+
+        stem = f'odom_{pair.sequence}_{pair.src_idx:06d}_to_{pair.tgt_idx:06d}'
+        csv_path = os.path.join(args.outfile, f'{stem}.csv')
+        metrics_path = os.path.join(args.outfile, f'{stem}.metrics.json')
+        np.savetxt(csv_path, np.concatenate(output_columns, axis=1), delimiter=',', fmt='%.6f')
+        with open(metrics_path, 'w', encoding='utf-8') as stream:
+            json.dump(metrics, stream, indent=2, ensure_ascii=False)
+        print(f'Saved {csv_path}')
+
+
 def main(args):
     cfg = get_cfg_defaults()
     cfg.merge_from_file(args.config)
@@ -51,7 +153,7 @@ def main(args):
 
     # computational stuff
     use_amp = cfg.USE_AMP
-    device = 'cuda'
+    device = torch.device('cuda:0')
 
     # model: Topo9
     print("Using Topo9 (Original Topo + L4-only sparse residual topology coupling)")
@@ -67,6 +169,10 @@ def main(args):
 
     if not os.path.exists(args.outfile):
         os.makedirs(args.outfile)
+
+    if getattr(args, 'dataset', 'lung') == 'kitti_odom':
+        run_kitti_odometry_inference(args, cfg, model, device, use_amp)
+        return
 
     if getattr(args, 'dataset', 'lung') == 'kitti':
         kitti_root = getattr(args, 'kitti_root', '../mmdetection3d/data/kitti/testing/velodyne')
@@ -172,17 +278,59 @@ if __name__ == "__main__":
                         help="output file for keypoint displacement predictions")
     parser.add_argument('--config', default='config_ppwc_sup.yaml',
                         help="config file of the model (yaml)")
-    parser.add_argument("--gpu", default="0", help="gpu to train on")
-    parser.add_argument('--dataset', default='lung', choices=['lung', 'kitti'],
+    parser.add_argument("--gpu", type=int, default=0,
+                        help="physical GPU index to expose to this process")
+    parser.add_argument('--dataset', default='lung', choices=['lung', 'kitti', 'kitti_odom'],
                         help="dataset to use")
     parser.add_argument('--kitti_root', default='../mmdetection3d/data/kitti/testing/velodyne',
                         help="folder containing kitti bin files")
+    parser.add_argument('--odom-root', dest='odom_root', default='D:/kitti_odometry',
+                        help='KITTI odometry root containing the official extracted folders')
+    parser.add_argument('--seqs', nargs='+', default=['00'],
+                        help='odometry sequence IDs, for example: --seqs 00 01')
+    parser.add_argument('--start', type=int, default=0,
+                        help='first source frame position in each sequence')
+    parser.add_argument('--count', type=int, default=20,
+                        help='number of frame pairs per sequence')
+    parser.add_argument('--gap', type=int, default=1,
+                        help='frame gap between source and target')
+    parser.add_argument('--odom-num-points', dest='odom_num_points', type=int, default=8192,
+                        help='deterministically sampled points per frame')
+    parser.add_argument('--odom-seed', dest='odom_seed', type=int, default=0,
+                        help='base seed for deterministic odometry sampling')
 
     args = parser.parse_args()
 
+    if args.gpu < 0:
+        parser.error('--gpu must be a non-negative physical GPU index')
+    for name in ('start',):
+        if getattr(args, name) < 0:
+            parser.error(f'--{name} must be non-negative')
+    for name in ('count', 'gap', 'odom_num_points'):
+        if getattr(args, name) < 1:
+            parser.error(f'--{name.replace("_", "-")} must be at least 1')
+
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+
+    # Import every Torch-dependent project module only after selecting the GPU.
     import torch
+    from ppwc import Topo9_PointPWC
+    try:
+        from topology import compute_topo_features
+    except ImportError:
+        compute_topo_features = None
+
+    if not torch.cuda.is_available():
+        parser.error(
+            f'physical GPU {args.gpu} is unavailable; '
+            'check --gpu and CUDA_VISIBLE_DEVICES'
+        )
+    torch.cuda.set_device(0)
+    print(
+        f'GPU selection: physical GPU {args.gpu} -> logical cuda:0 '
+        f'({torch.cuda.get_device_name(0)})'
+    )
 
     print(args)
     main(args)

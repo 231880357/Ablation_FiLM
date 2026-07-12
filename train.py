@@ -5,8 +5,17 @@ import numpy as np
 from tqdm import tqdm
 
 from defaults import get_cfg_defaults
-from dataset import Lung250MDataset, KittiDataset
-from ppwc import Topo9_PointPWC, multiScaleLoss, topo_pyramid_loss
+
+
+def _parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {'1', 'true', 'yes', 'on'}:
+        return True
+    if normalized in {'0', 'false', 'no', 'off'}:
+        return False
+    raise argparse.ArgumentTypeError(f'Expected a boolean value, got {value!r}')
 
 
 def _cuda_memory_stats(device):
@@ -30,6 +39,15 @@ def _print_cuda_memory(prefix, device):
     )
 
 
+def _limit_dataset(dataset, limit):
+    if hasattr(dataset, 'case_list'):
+        dataset.case_list = dataset.case_list[:limit]
+    elif hasattr(dataset, 'pair_list'):
+        dataset.pair_list = dataset.pair_list[:limit]
+    else:
+        dataset.file_list = dataset.file_list[:limit]
+
+
 def train(cfg, args):
     root = cfg.BASE_DIRECTORY
     exp_name = cfg.EXPERIMENT_NAME
@@ -49,8 +67,8 @@ def train(cfg, args):
     # computational stuff
     use_amp = cfg.USE_AMP
     num_workers = args.num_workers if args.num_workers is not None else (0 if args.debug else cfg.NUM_WORKERS)
-    device = cfg.DEVICE
-    pin_memory = bool(cfg.DATA.PIN_MEMORY and device.startswith('cuda'))
+    device = torch.device('cuda:0' if cfg.DEVICE.startswith('cuda') else cfg.DEVICE)
+    pin_memory = bool(cfg.DATA.PIN_MEMORY and device.type == 'cuda')
     persistent_workers = bool(cfg.DATA.PERSISTENT_WORKERS and num_workers > 0)
     dataloader_kwargs = {
         'batch_size': batch_size,
@@ -75,20 +93,24 @@ def train(cfg, args):
         raise ValueError()
 
     # datasets
-    if getattr(args, 'dataset', 'lung') == 'kitti':
+    dataset_name = getattr(args, 'dataset', 'lung')
+    if dataset_name == 'kitti':
         train_set = KittiDataset(cfg, args, phase='train', split='train')
+    elif dataset_name == 'kitti_odom':
+        train_set = KittiOdometryDataset(cfg, args, phase='train', split='train')
     else:
         train_set = Lung250MDataset(cfg, args, phase='train', split='train')
     if args.debug:
-        if hasattr(train_set, 'case_list'):
-            train_set.case_list = train_set.case_list[:8]
-        else:
-            train_set.file_list = train_set.file_list[:8]
+        _limit_dataset(train_set, 8)
+    if len(train_set) < batch_size:
+        raise ValueError(
+            f'Training dataset has {len(train_set)} samples, fewer than batch_size={batch_size}'
+        )
     train_loader = DataLoader(train_set, shuffle=True, drop_last=True, **dataloader_kwargs)
 
     vram_test = bool(getattr(args, 'vram_test', False))
     if vram_test:
-        if not device.startswith('cuda') or not torch.cuda.is_available():
+        if device.type != 'cuda' or not torch.cuda.is_available():
             raise RuntimeError('VRAM test requires a CUDA device')
         val_loader = None
         torch.cuda.reset_peak_memory_stats(device)
@@ -98,21 +120,21 @@ def train(cfg, args):
         )
         _print_cuda_memory('VRAM baseline', device)
     else:
-        if getattr(args, 'dataset', 'lung') == 'kitti':
+        if dataset_name == 'kitti':
             val_set = KittiDataset(cfg, args, phase='test', split='val')
+        elif dataset_name == 'kitti_odom':
+            val_set = KittiOdometryDataset(cfg, args, phase='test', split='val')
         else:
             val_set = Lung250MDataset(cfg, args, phase='test', split='val')
         if args.debug:
-            if hasattr(val_set, 'case_list'):
-                val_set.case_list = val_set.case_list[:8]
-            else:
-                val_set.file_list = val_set.file_list[:8]
+            _limit_dataset(val_set, 8)
         val_loader = DataLoader(val_set, shuffle=False, drop_last=False, **dataloader_kwargs)
 
     # logging
     validation_log = np.zeros([num_epochs, 3])
 
     completed_train_steps = 0
+    stop_after_epoch = False
     for ep in range(1, num_epochs + 1):
         print('Started epoch {}/{}'.format(ep, num_epochs))
         model.train()
@@ -156,8 +178,8 @@ def train(cfg, args):
             scaler.step(optimizer)
             scaler.update()
 
+            completed_train_steps += 1
             if vram_test:
-                completed_train_steps += 1
                 _print_cuda_memory(f'VRAM step {completed_train_steps}', device)
                 if completed_train_steps >= args.vram_test_steps:
                     print(
@@ -166,6 +188,12 @@ def train(cfg, args):
                     )
                     return
 
+            if args.max_train_steps is not None and completed_train_steps >= args.max_train_steps:
+                stop_after_epoch = True
+                break
+
+        if not loss_values:
+            raise RuntimeError('No finite training loss was produced in this epoch')
         train_loss = np.mean(loss_values)
         validation_log[ep - 1, 0] = train_loss
         lr_scheduler.step()
@@ -174,6 +202,7 @@ def train(cfg, args):
         model.eval()
         epe_3d = 0
         epe_initial = 0
+        val_samples = 0
         val_bar = tqdm(val_loader, desc=f"Epoch {ep}/{num_epochs} [val]", leave=False)
         for it, data in enumerate(val_bar, 1):
             pcd_src, pcd_tgt, color_src, color_tgt, gt_flow, topo_src, topo_tgt, idx = data
@@ -195,10 +224,16 @@ def train(cfg, args):
             err_per_sample = (pred_flow - gt_flow).square().sum(dim=2).sqrt().mean(dim=1)
             epe_3d += err_per_sample.sum().item()
             epe_initial += gt_flow.square().sum(dim=2).sqrt().mean(dim=1).sum().item()
+            val_samples += len(err_per_sample)
             val_bar.set_postfix(curr_epe=f"{err_per_sample.mean().item() * val_loader.dataset.norm_factor:.4f}")
 
-        epe_3d = epe_3d / len(val_loader.dataset) * val_loader.dataset.norm_factor
-        epe_initial = epe_initial / len(val_loader.dataset) * val_loader.dataset.norm_factor
+            if args.max_val_steps is not None and it >= args.max_val_steps:
+                break
+
+        if val_samples == 0:
+            raise RuntimeError('Validation loader produced no samples')
+        epe_3d = epe_3d / val_samples * val_loader.dataset.norm_factor
+        epe_initial = epe_initial / val_samples * val_loader.dataset.norm_factor
         validation_log[ep - 1, 1:] = [epe_initial, epe_3d]
 
         end_time = time.time()
@@ -209,14 +244,19 @@ def train(cfg, args):
         torch.save(model.state_dict(), model_path)
         if ep % cfg.SOLVER.CHECKPOINT_INTERVAL == 0:
             torch.save(model.state_dict(), model_path_ep.format(ep))
+        if stop_after_epoch:
+            print(f'Stopped after requested {completed_train_steps} training step(s)')
+            return
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PyTorch Object Detection Training")
     parser.add_argument('--config', default='config_ppwc_sup.yaml',
                         help="config file of the model (yaml)")
-    parser.add_argument("--debug", default=False, help="whether to use debug mode", type=bool)
-    parser.add_argument("--gpu", default="0", help="gpu to train on")
+    parser.add_argument('--debug', nargs='?', const=True, default=False, type=_parse_bool,
+                        help='limit datasets to 8 samples; optionally pass true/false')
+    parser.add_argument("--gpu", type=int, default=0,
+                        help="physical GPU index to expose to this process")
     parser.add_argument('-CTr', '--cloudfolder_train', default='../cloudsTr/coordinates',
                         help="folder containing (/case_???_{1,2}.pth)")
     parser.add_argument('-CVal', '--cloudfolder_val', default='../cloudsTs/coordinates',
@@ -225,12 +265,26 @@ if __name__ == "__main__":
                         help='folder containing ground truth (.pth)')
     parser.add_argument('-SVal','--supfolder_val', default='../corrfieldFlowPcdTs', 
                         help='folder containing ground truth (.pth)')
-    parser.add_argument('--dataset', default='lung', choices=['lung', 'kitti'],
+    parser.add_argument('--dataset', default='lung', choices=['lung', 'kitti', 'kitti_odom'],
                         help="dataset to use")
     parser.add_argument('--kitti_root', default='../mmdetection3d/data/kitti/training/velodyne',
                         help="folder containing kitti bin files")
     parser.add_argument('--kitti_sequences', nargs='+', default=None,
                         help='KITTI odometry sequence IDs, for example: 00 01')
+    parser.add_argument('--odom-root', dest='odom_root', default='D:/kitti_odometry',
+                        help='KITTI odometry root containing the official extracted folders')
+    parser.add_argument('--odom-train-seqs', dest='odom_train_seqs', default='00,01,02,03,04,05,06,07',
+                        help='comma-separated pose-supervised training sequences')
+    parser.add_argument('--odom-val-seqs', dest='odom_val_seqs', default='08,09,10',
+                        help='comma-separated pose-supervised validation sequences')
+    parser.add_argument('--odom-gap', dest='odom_gap', type=int, default=1,
+                        help='frame gap between source and target')
+    parser.add_argument('--odom-max-pairs', dest='odom_max_pairs', type=int, default=None,
+                        help='limit pairs per split for small tests')
+    parser.add_argument('--odom-num-points', dest='odom_num_points', type=int, default=8192,
+                        help='deterministically sampled points per frame')
+    parser.add_argument('--odom-seed', dest='odom_seed', type=int, default=0,
+                        help='base seed for deterministic odometry sampling')
     parser.add_argument('--batch_size', type=int, default=None,
                         help='override batch size from config')
     parser.add_argument('--num_workers', type=int, default=None,
@@ -239,24 +293,58 @@ if __name__ == "__main__":
                         help='run a short KITTI odometry 00/01 training VRAM test')
     parser.add_argument('--vram_test_steps', type=int, default=10,
                         help='number of optimizer steps for --vram_test')
+    parser.add_argument('--max-train-steps', dest='max_train_steps', type=int, default=None,
+                        help='stop after this many optimizer steps, then run validation and save')
+    parser.add_argument('--max-val-steps', dest='max_val_steps', type=int, default=None,
+                        help='limit validation batches for a small training test')
 
     args = parser.parse_args()
 
     if args.vram_test:
-        if args.dataset != 'kitti':
-            parser.error('--vram_test requires --dataset kitti')
+        if args.dataset not in {'kitti', 'kitti_odom'}:
+            parser.error('--vram_test requires --dataset kitti or kitti_odom')
         if args.vram_test_steps < 1:
             parser.error('--vram_test_steps must be at least 1')
-        args.kitti_sequences = ['00', '01']
+        if args.dataset == 'kitti':
+            args.kitti_sequences = ['00', '01']
+        else:
+            args.odom_train_seqs = '00,01'
 
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
-    import torch
-    import torch.optim as optim
-    from torch.utils.data import DataLoader
+    for name in ('odom_gap', 'odom_num_points'):
+        if getattr(args, name) < 1:
+            parser.error(f'--{name.replace("_", "-")} must be at least 1')
+    for name in ('odom_max_pairs', 'max_train_steps', 'max_val_steps'):
+        value = getattr(args, name)
+        if value is not None and value < 1:
+            parser.error(f'--{name.replace("_", "-")} must be at least 1')
+
+    if args.gpu < 0:
+        parser.error('--gpu must be a non-negative physical GPU index')
 
     cfg = get_cfg_defaults()
     cfg.merge_from_file(args.config)
     cfg.freeze()
+
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+
+    # Import every Torch-dependent project module only after selecting the GPU.
+    import torch
+    import torch.optim as optim
+    from torch.utils.data import DataLoader
+    from dataset import KittiDataset, KittiOdometryDataset, Lung250MDataset
+    from ppwc import Topo9_PointPWC, multiScaleLoss, topo_pyramid_loss
+
+    if cfg.DEVICE.startswith('cuda'):
+        if not torch.cuda.is_available():
+            parser.error(
+                f'physical GPU {args.gpu} is unavailable; '
+                'check --gpu and CUDA_VISIBLE_DEVICES'
+            )
+        torch.cuda.set_device(0)
+        print(
+            f'GPU selection: physical GPU {args.gpu} -> logical cuda:0 '
+            f'({torch.cuda.get_device_name(0)})'
+        )
 
     train(cfg, args)

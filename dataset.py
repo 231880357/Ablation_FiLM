@@ -3,9 +3,22 @@ import glob
 import numpy as np
 import torch
 import torch.utils.data
-import open3d as o3d
+try:
+    import open3d as o3d
+except ImportError:
+    o3d = None
 import numpy as _np
 import hashlib
+from kitti_odometry_utils import (
+    build_odometry_pairs,
+    deterministic_sample,
+    load_calibration_transform,
+    load_pose_matrices,
+    load_velodyne_points,
+    parse_sequence_ids,
+    relative_velodyne_transform,
+    transform_points,
+)
 try:
     from .topology import compute_topo_features
 except Exception:
@@ -203,6 +216,10 @@ class Lung250MDataset(_TopologyCacheMixin, torch.utils.data.Dataset):
 
         if self.is_train:
             if self.augm_setting.METHOD == 'multiscale_local_global':
+                if o3d is None:
+                    raise ImportError(
+                        'open3d is required for multiscale_local_global augmentation'
+                    )
                 if np.random.uniform() < 0.5:
                     pcd = pcd_src
                     feat_for_augm = topo_feat_src
@@ -478,3 +495,122 @@ class KittiDataset(_TopologyCacheMixin, torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.file_list)
+
+
+class KittiOdometryDataset(_TopologyCacheMixin, torch.utils.data.Dataset):
+    def __init__(self, cfg, args, phase, split):
+        self.is_train = phase == 'train'
+        self.split = split
+        self.use_topo = cfg.MODEL.TOPO_FEAT_DIM > 0
+        self.topo_dim = cfg.MODEL.TOPO_FEAT_DIM
+        self.norm_factor = cfg.INPUT.SCALE_NORM_FACTOR
+        self.num_points = int(getattr(args, 'odom_num_points', 8192))
+        self.sample_seed = int(getattr(args, 'odom_seed', 0))
+        self.odom_root = getattr(args, 'odom_root', 'D:/kitti_odometry')
+        self.gap = int(getattr(args, 'odom_gap', 1))
+        self._sequence_cache = {}
+        self._init_topology_cache(cfg, f'{split}_kitti_odom')
+
+        sequence_values = (
+            getattr(args, 'odom_train_seqs', None)
+            if split == 'train'
+            else getattr(args, 'odom_val_seqs', None)
+        )
+        default_sequences = (
+            ['00', '01', '02', '03', '04', '05', '06', '07']
+            if split == 'train'
+            else ['08', '09', '10']
+        )
+        self.sequence_ids = parse_sequence_ids(sequence_values, default_sequences)
+        self.pair_list = build_odometry_pairs(
+            self.odom_root,
+            self.sequence_ids,
+            gap=self.gap,
+            max_pairs=getattr(args, 'odom_max_pairs', None),
+            require_poses=True,
+        )
+        if not self.pair_list:
+            raise RuntimeError(
+                f'No KITTI odometry pairs found for split={split}, '
+                f'sequences={self.sequence_ids}'
+            )
+        print(
+            f"KITTI odometry {split}: sequences={','.join(self.sequence_ids)}, "
+            f'pairs={len(self.pair_list)}, gap={self.gap}, points={self.num_points}'
+        )
+
+    def _sequence_geometry(self, pair):
+        if pair.sequence not in self._sequence_cache:
+            self._sequence_cache[pair.sequence] = (
+                load_calibration_transform(pair.calib_path),
+                load_pose_matrices(pair.pose_path),
+            )
+        return self._sequence_cache[pair.sequence]
+
+    def __getitem__(self, idx):
+        pair = self.pair_list[idx]
+        src_full = load_velodyne_points(pair.src_bin)
+        tgt_full = load_velodyne_points(pair.tgt_bin)
+        src, _ = deterministic_sample(
+            src_full,
+            self.num_points,
+            f'{pair.sequence}:{pair.src_idx}:src',
+            self.sample_seed,
+        )
+        tgt, _ = deterministic_sample(
+            tgt_full,
+            self.num_points,
+            f'{pair.sequence}:{pair.tgt_idx}:tgt',
+            self.sample_seed,
+        )
+
+        calib_transform, poses = self._sequence_geometry(pair)
+        relative_transform = relative_velodyne_transform(
+            calib_transform, poses, pair.src_idx, pair.tgt_idx
+        )
+        aligned_src = transform_points(src, relative_transform)
+        gt_flow = (aligned_src - src) / self.norm_factor
+
+        target_mean = np.mean(tgt, axis=0)
+        pcd_src = (src - target_mean) / self.norm_factor
+        pcd_tgt = (tgt - target_mean) / self.norm_factor
+
+        cache_prefix = (
+            f'odom_{pair.sequence}_{pair.src_idx:06d}_to_{pair.tgt_idx:06d}'
+            f'_gap{self.gap}_points{self.num_points}_seed{self.sample_seed}'
+        )
+        topo_feat_src = self._get_cached_topology(
+            f'{cache_prefix}_src',
+            pcd_src,
+            self.topo_dim,
+            f'odom-{pair.sequence}-{pair.src_idx:06d}-src',
+        )
+        topo_feat_tgt = self._get_cached_topology(
+            f'{cache_prefix}_tgt',
+            pcd_tgt,
+            self.topo_dim,
+            f'odom-{pair.sequence}-{pair.tgt_idx:06d}-tgt',
+        )
+        color_src, color_tgt, topo_feat_src, topo_feat_tgt = _compose_input_features(
+            pcd_src, pcd_tgt, topo_feat_src, topo_feat_tgt, self.use_topo, self.topo_dim
+        )
+
+        outputs = (pcd_src, pcd_tgt, color_src, color_tgt, gt_flow)
+        if not all(np.isfinite(value).all() for value in outputs):
+            raise ValueError(
+                f'Non-finite KITTI odometry sample: '
+                f'{pair.sequence}:{pair.src_idx}->{pair.tgt_idx}'
+            )
+        return (
+            np.float32(pcd_src),
+            np.float32(pcd_tgt),
+            np.float32(color_src),
+            np.float32(color_tgt),
+            np.float32(gt_flow),
+            np.float32(topo_feat_src),
+            np.float32(topo_feat_tgt),
+            idx,
+        )
+
+    def __len__(self):
+        return len(self.pair_list)
