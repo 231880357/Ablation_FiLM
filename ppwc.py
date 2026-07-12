@@ -4,7 +4,6 @@ Topo9: Original Topo + L4-only Sparse Residual Topology Coupling
 - Level 1-3: Standard PointConvD      (same as original Topo)
 - Level 4:   TopoCoupledPointConvD_v2 (only topology coupling point)
 - Cost Volume & Flow Estimator: same as original Topo
-- Auxiliary: topo_pyramid_loss
 """
 
 import torch.nn as nn
@@ -224,27 +223,6 @@ def multiScaleLoss(pred_flows, gt_flow, fps_idxs):
         total_loss += torch.square(diff_flow).mean()
 
     return total_loss
-
-
-def topo_pyramid_loss(pcd_src, pcd_tgt, pred_flow, k=20):
-    """
-    Differentiable topology consistency loss via local distance matrix alignment.
-    """
-    warped = pcd_src + pred_flow.permute(0, 2, 1)  # [B, N, 3]
-    
-    dist_warped = torch.cdist(warped, warped)  # [B, N, N]
-    dist_tgt = torch.cdist(pcd_tgt, pcd_tgt)   # [B, N, N]
-    
-    k_eff = min(k, warped.shape[1])
-    _, knn_idx = torch.topk(dist_warped, k=k_eff, dim=-1, largest=False)
-    mask = torch.zeros_like(dist_warped)
-    mask.scatter_(-1, knn_idx, 1.0)
-    mask = mask + mask.transpose(-2, -1)
-    mask = (mask > 0).float()
-    
-    diff = (dist_warped - dist_tgt) * mask
-    loss = diff.pow(2).sum() / (mask.sum() + 1e-8)
-    return loss
 
 
 def curvature(pc):

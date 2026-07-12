@@ -139,14 +139,17 @@ def train(cfg, args):
         print('Started epoch {}/{}'.format(ep, num_epochs))
         model.train()
         loss_values = []
+        flow_loss_values = []
+        topo_loss_values = []
         start_time = time.time()
 
-        # The lung source/target clouds are independently sampled and shuffled, so
-        # equal indices do not identify corresponding anatomical points.  The
-        # current topology loss compares pairwise-distance matrices by index and
-        # therefore supplies an invalid training signal for this dataset.  Keep it
-        # disabled until it is replaced by a correspondence-invariant objective.
-        lambda_topo = 0.0
+        topo_target_weight = float(cfg.SOLVER.TOPO_LOSS_WEIGHT)
+        topo_warmup_epochs = int(cfg.SOLVER.TOPO_LOSS_WARMUP_EPOCHS)
+        if topo_warmup_epochs > 0:
+            topo_warmup_ratio = min(1.0, max(0.0, (ep - 1) / topo_warmup_epochs))
+            lambda_topo = topo_target_weight * topo_warmup_ratio
+        else:
+            lambda_topo = topo_target_weight
         
         train_bar = tqdm(train_loader, desc=f"Epoch {ep}/{num_epochs} [train]", leave=False)
         for it, data in enumerate(train_bar, 1):
@@ -165,11 +168,18 @@ def train(cfg, args):
                 )
                 loss_flow = multiScaleLoss(pred_flows, gt_flow, fps_pc1_idxs)
                 if lambda_topo > 0.0:
-                    loss_topo = topo_pyramid_loss(pcd_src, pcd_tgt, pred_flows[0], k=20)
+                    loss_topo = topology_edge_loss(
+                        pcd_src,
+                        gt_flow,
+                        pred_flows[0],
+                        k=cfg.SOLVER.TOPO_LOSS_K,
+                        num_anchors=cfg.SOLVER.TOPO_LOSS_NUM_ANCHORS,
+                        query_chunk_size=cfg.SOLVER.TOPO_LOSS_QUERY_CHUNK_SIZE,
+                        beta=cfg.SOLVER.TOPO_LOSS_BETA,
+                    )
                     loss = loss_flow + lambda_topo * loss_topo
                 else:
-                    # Avoid allocating two [B, N, N] distance matrices when the
-                    # invalid auxiliary objective is disabled.
+                    loss_topo = loss_flow.new_zeros(())
                     loss = loss_flow
 
             if torch.isnan(loss) or torch.isinf(loss):
@@ -177,7 +187,15 @@ def train(cfg, args):
                 continue
                 
             loss_values.append(loss.item())
-            train_bar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
+            flow_loss_values.append(loss_flow.item())
+            topo_loss_values.append(loss_topo.item())
+            train_bar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                flow=f"{loss_flow.item():.4f}",
+                topo=f"{loss_topo.item():.4f}",
+                topo_w=f"{lambda_topo:.3f}",
+                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+            )
             loss = loss * cfg.SOLVER.LOSS_FACTOR
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -205,6 +223,8 @@ def train(cfg, args):
         if not loss_values:
             raise RuntimeError('No finite training loss was produced in this epoch')
         train_loss = np.mean(loss_values)
+        train_flow_loss = np.mean(flow_loss_values)
+        train_topo_loss = np.mean(topo_loss_values)
         validation_log[ep - 1, 0] = train_loss
         lr_scheduler.step()
 
@@ -248,6 +268,8 @@ def train(cfg, args):
 
         end_time = time.time()
         print('epoch', ep, 'duration', '%0.3f' % ((end_time - start_time) / 60.), 'train_loss', '%0.6f' % train_loss,
+              'flow_loss', '%0.6f' % train_flow_loss, 'topo_loss', '%0.6f' % train_topo_loss,
+              'topo_weight', '%0.6f' % lambda_topo,
               'initial error', epe_initial, 'EPEs', epe_3d)
 
         np.save(os.path.join(out_folder, "validation_history.npy"), validation_log)
@@ -343,7 +365,8 @@ if __name__ == "__main__":
     import torch.optim as optim
     from torch.utils.data import DataLoader
     from dataset import KittiDataset, KittiOdometryDataset, Lung250MDataset
-    from ppwc import Topo9_PointPWC, multiScaleLoss, topo_pyramid_loss
+    from ppwc import Topo9_PointPWC, multiScaleLoss
+    from topology_loss import topology_edge_loss
 
     if cfg.DEVICE.startswith('cuda'):
         if not torch.cuda.is_available():
