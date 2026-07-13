@@ -5,6 +5,7 @@ import numpy as np
 from tqdm import tqdm
 
 from defaults import get_cfg_defaults
+from training_run_document import write_training_run_document
 
 
 def _parse_bool(value):
@@ -129,6 +130,26 @@ def train(cfg, args):
         if args.debug:
             _limit_dataset(val_set, 8)
         val_loader = DataLoader(val_set, shuffle=False, drop_last=False, **dataloader_kwargs)
+
+    run_document = write_training_run_document(
+        out_folder,
+        cfg,
+        args,
+        model=model,
+        train_size=len(train_set),
+        val_size=None if vram_test else len(val_set),
+        effective_settings={
+            'batch_size': batch_size,
+            'device': device,
+            'gpu_argument': args.gpu,
+            'num_workers': num_workers,
+            'persistent_workers': persistent_workers,
+            'pin_memory': pin_memory,
+            'torch_version': torch.__version__,
+            'use_amp': use_amp,
+        },
+    )
+    print(f'Training run document: {run_document}')
 
     # logging
     validation_log = np.zeros([num_epochs, 3])
