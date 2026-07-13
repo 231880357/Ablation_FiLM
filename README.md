@@ -66,6 +66,50 @@ python train.py --config config_ppwc_sup.yaml --gpu 0
 python inference.py --config config_ppwc_sup.yaml --model model_best.pth
 ```
 
+### KITTI Odometry 连续帧训练
+
+`kitti_odom` 使用官方连续帧和 pose 生成监督场景流。下面的配置固定使用 sequence `00-07`
+训练、`08-10` 验证、相邻帧间隔 1、每帧确定性采样 8192 点。每次启动还会在
+`train_out_kitti_odom/topo9_kitti_odom/` 生成一份 `training_run_*.md` 参数记录。
+
+```bash
+python -X utf8 train.py \
+  --dataset kitti_odom \
+  --odom-root ../kitti_odometry \
+  --odom-train-seqs 00,01,02,03,04,05,06,07 \
+  --odom-val-seqs 08,09,10 \
+  --odom-gap 1 \
+  --odom-num-points 8192 \
+  --odom-seed 0 \
+  --config config_ppwc_kitti_odom.yaml \
+  --gpu 1
+```
+
+### KITTI Odometry 推理
+
+以下命令对验证 sequence `08-10` 各推理前 20 个相邻帧 pair。推理的 `gap`、点数、
+采样 seed 和配置必须与训练保持一致。
+
+```bash
+python -X utf8 inference.py \
+  --dataset kitti_odom \
+  --odom-root ../kitti_odometry \
+  --seqs 08 09 10 \
+  --start 0 \
+  --count 20 \
+  --gap 1 \
+  --odom-num-points 8192 \
+  --odom-seed 0 \
+  --config config_ppwc_kitti_odom.yaml \
+  -M train_out_kitti_odom/topo9_kitti_odom/model.pth \
+  -O prediction_kitti_odom \
+  --gpu 1
+```
+
+每个 pair 会生成一个 CSV 和一个 `.metrics.json`。对有公开 pose 的 sequence `00-10`，
+指标文件还包含 `model_to_pose_epe` 和 pose 对齐后的最近邻误差。更完整的数据目录说明和
+小规模测试命令见 [`README_kitti.md`](README_kitti.md)。
+
 ## 实验数据
 
 暂无实验数据记录。
