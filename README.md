@@ -113,3 +113,15 @@ python -X utf8 inference.py \
 ## 实验数据
 
 暂无实验数据记录。
+
+## 拓扑缓存与 FiLM 诊断
+
+训练结束后可同时检查拓扑缓存异常，以及 FiLM `gamma/beta` 生成器参数和实际输出是否仍接近 0：
+
+```powershell
+python -X utf8 diagnose_topology_film.py `
+  --cache-dir topo_cache `
+  --checkpoint train_out_kitti_odom\topo9_kitti_odom\model.pth
+```
+
+脚本检查损坏文件、维度错误、NaN/Inf、负数、全零回退值、异常量级和分布离群点；随后用有效缓存向量重放 checkpoint 中的 `film_gen -> gamma/beta`。默认以最大绝对值 `1e-6` 作为接近 0 的判据，可通过 `--near-zero-threshold` 调整。发现缓存错误或接近 0 的 FiLM 分组时退出码为 `1`，checkpoint 无法读取时为 `2`。
