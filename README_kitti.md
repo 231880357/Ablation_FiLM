@@ -33,8 +33,20 @@ python -X utf8 train.py --dataset kitti_odom --odom-root ../kitti_odometry --odo
 正式训练：
 
 ```powershell
-python -X utf8 train.py --dataset kitti_odom --odom-root ../kitti_odometry --config config_ppwc_kitti_odom.yaml --gpu 1
+python -X utf8 train.py `
+  --dataset kitti_odom `
+  --odom-root D:\kitti_odometry `
+  --odom-train-seqs 00,01,02,03,04,05,06,07 `
+  --odom-val-seqs 08,09,10 `
+  --odom-gap 1 `
+  --odom-num-points 8192 `
+  --odom-seed 0 `
+  --config config_ppwc_kitti_odom.yaml `
+  --gpu 1
 ```
+
+每次训练会在 `train_out_kitti_odom\topo9_kitti_odom\` 下生成唯一的
+`training_run_*.md`，记录配置、命令行参数、Git 提交、数据路径和运行环境。
 
 对 sequence 00 的前三个 pair 推理：
 
@@ -46,6 +58,8 @@ python -X utf8 inference.py `
   --start 0 `
   --count 3 `
   --gap 1 `
+  --odom-num-points 8192 `
+  --odom-seed 0 `
   --config config_ppwc_kitti_odom.yaml `
   --model train_out_kitti_odom\topo9_kitti_odom\model.pth `
   --outfile prediction_kitti_odom `
