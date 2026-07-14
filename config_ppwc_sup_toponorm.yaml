@@ -1,11 +1,13 @@
 BASE_DIRECTORY: 'train_out'
-EXPERIMENT_NAME: 'sup_16k_rigidAug1-2'
+EXPERIMENT_NAME: 'sup_16k_rigidAug1-2_toponorm_v2'
 NUM_WORKERS: 8
 USE_AMP: False
 DEVICE: 'cuda'
 DATA:
   TOPO_CACHE_VERSION: 'v2'
-  TOPO_NORMALIZATION: 'none'
+  TOPO_NORMALIZATION: 'zscore'
+  TOPO_STATS_PATH: 'topo_cache/Lung250MDataset/v2/train_stats.json'
+  TOPO_NORM_EPS: 1.0e-6
 MODEL:
   PPWC_SFPC_BN: False
   TOPO_FEAT_DIM: 6
@@ -28,5 +30,5 @@ INPUT:
 AUGMENTATIONS:
   METHOD: 'rigid_one'
   MAX_ROTATION_ANGLE: 10.
-  MAX_SCALE_OFFSET: 0.1
+  MAX_SCALE_OFFSET: 0.0
   MAX_TRANSLATION: 0.005

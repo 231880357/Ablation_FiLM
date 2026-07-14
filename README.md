@@ -116,12 +116,40 @@ python -X utf8 inference.py \
 
 ## 拓扑缓存与 FiLM 诊断
 
-训练结束后可同时检查拓扑缓存异常，以及 FiLM `gamma/beta` 生成器参数和实际输出是否仍接近 0：
+旧版 `config_ppwc_sup.yaml` 保持未归一化行为，用于复现已有 checkpoint。新实验先用
+`config_ppwc_sup_toponorm.yaml` 生成内容寻址的原始缓存和仅基于训练集的 z-score 统计：
 
-```powershell
-python -X utf8 diagnose_topology_film.py `
-  --cache-dir topo_cache `
-  --checkpoint train_out_kitti_odom\topo9_kitti_odom\model.pth
+```bash
+python -X utf8 prepare_topology_cache.py \
+  --config config_ppwc_sup_toponorm.yaml \
+  --cloudfolder-train /path/to/lung/cloudsTr/coordinates \
+  --cloudfolder-val /path/to/lung/cloudsTs/coordinates \
+  --supfolder-train /path/to/lung/corrfieldFlowPcdTr \
+  --supfolder-val /path/to/lung/corrfieldFlowPcdTs \
+  --lung-index-file /path/to/lung/ind_16384_train.pth
 ```
 
-脚本检查损坏文件、维度错误、NaN/Inf、负数、全零回退值、异常量级和分布离群点；随后用有效缓存向量重放 checkpoint 中的 `film_gen -> gamma/beta`。默认以最大绝对值 `1e-6` 作为接近 0 的判据，可通过 `--near-zero-threshold` 调整。发现缓存错误或接近 0 的 FiLM 分组时退出码为 `1`，checkpoint 无法读取时为 `2`。
+训练时使用相同配置和统计文件：
+
+```bash
+python -X utf8 train.py \
+  --dataset lung \
+  --config config_ppwc_sup_toponorm.yaml \
+  --cloudfolder_train /path/to/lung/cloudsTr/coordinates \
+  --cloudfolder_val /path/to/lung/cloudsTs/coordinates \
+  --supfolder_train /path/to/lung/corrfieldFlowPcdTr \
+  --supfolder_val /path/to/lung/corrfieldFlowPcdTs \
+  --lung-index-file /path/to/lung/ind_16384_train.pth \
+  --gpu 0
+```
+
+训练结束后检查原始缓存，并使用训练统计重放归一化后的 FiLM 输入：
+
+```bash
+python -X utf8 diagnose_topology_film.py \
+  --cache-dir topo_cache/Lung250MDataset/v2/train_lung \
+  --stats-file topo_cache/Lung250MDataset/v2/train_stats.json \
+  --checkpoint train_out/sup_16k_rigidAug1-2_toponorm_v2/model.pth
+```
+
+诊断脚本检查损坏文件、维度错误、NaN/Inf、负数、全零回退值、异常量级和分布离群点；原始缓存分布不会被归一化改变，只有 FiLM replay 输入使用训练集 z-score。发现缓存错误或接近 0 的 FiLM 分组时退出码为 `1`，统计或 checkpoint 无法读取时为 `2`。

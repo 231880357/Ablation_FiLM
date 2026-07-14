@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 
+from topology_preprocessing import TopologyNormalizer
+
 
 TOPOLOGY_FEATURE_NAMES = (
     "h0_mean_lifetime",
@@ -45,6 +47,7 @@ def inspect_topology_cache(
     max_abs_value: float = 1e6,
     outlier_z: float = 12.0,
     max_examples: int = 5,
+    active_files: Sequence[Path] | None = None,
 ) -> Tuple[Dict[str, Any], np.ndarray]:
     """Inspect cached topology vectors and return a report plus valid vectors."""
     cache_dir = Path(cache_dir)
@@ -66,7 +69,35 @@ def inspect_topology_cache(
         )
         return report, np.empty((0, topo_dim), dtype=np.float32)
 
-    files = sorted(cache_dir.rglob("*.npy"))
+    all_files = sorted(cache_dir.rglob("*.npy"))
+    files = all_files
+    if active_files is not None:
+        cache_root = cache_dir.resolve()
+        files = sorted(Path(path).resolve() for path in active_files)
+        outside = []
+        for path in files:
+            try:
+                path.relative_to(cache_root)
+            except ValueError:
+                outside.append(path)
+        if outside:
+            _add_finding(
+                report,
+                "errors",
+                "manifest_outside_cache",
+                f"Stats manifest entries are outside {cache_root}: {outside[:max_examples]}",
+            )
+            return report, np.empty((0, topo_dim), dtype=np.float32)
+        ignored = sorted({path.resolve() for path in all_files} - set(files))
+        if ignored:
+            examples = "; ".join(str(path) for path in ignored[:max_examples])
+            _add_finding(
+                report,
+                "warnings",
+                "orphan_cache_files",
+                f"Ignored {len(ignored)} cache files not present in the active training "
+                f"stats manifest. Examples: {examples}",
+            )
     report["file_count"] = len(files)
     if not files:
         _add_finding(
@@ -105,7 +136,11 @@ def inspect_topology_cache(
             record_issue("load_failed", path)
             continue
 
-        if vector.shape != (topo_dim,) or not np.issubdtype(vector.dtype, np.number):
+        if (
+            vector.shape != (topo_dim,)
+            or not np.issubdtype(vector.dtype, np.number)
+            or np.issubdtype(vector.dtype, np.complexfloating)
+        ):
             record_issue("shape_mismatch", path)
             continue
 
@@ -473,6 +508,7 @@ def print_checkpoint_report(report: Dict[str, Any]) -> None:
     print("\n=== FiLM gamma/beta ===")
     print(f"Checkpoint: {report['checkpoint']}")
     print(f"Near-zero threshold: {report['near_zero_threshold']:.6g}")
+    print(f"FiLM replay normalization: {report['normalization']}")
     print("Generator parameters:")
     for group in report["parameter_groups"]:
         print(f"  {group['name']}: {_format_stats(group['stats'])}")
@@ -507,6 +543,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cache-dir", type=Path, default=Path("topo_cache"))
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--stats-file",
+        type=Path,
+        default=None,
+        help=(
+            "train-only topology stats JSON; raw cache reporting is unchanged, "
+            "but FiLM replay inputs are z-score normalized"
+        ),
+    )
     parser.add_argument("--topo-dim", type=int, default=6)
     parser.add_argument(
         "--cache-zero-threshold",
@@ -551,6 +596,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.max_film_samples <= 0 or args.max_examples <= 0:
         parser.error("sample/example limits must be positive")
 
+    normalizer = None
+    active_files = None
+    normalization_label = "none (raw topology vectors)"
+    if args.stats_file is not None:
+        try:
+            normalizer = TopologyNormalizer.from_stats_file(
+                args.stats_file,
+                args.topo_dim,
+            )
+            normalization_label = f"zscore ({normalizer.stats_path})"
+            if args.cache_dir.resolve() == normalizer.source_cache_directory:
+                active_files = normalizer.manifest_cache_files()
+        except Exception as exc:
+            print(f"\n[FATAL] Topology normalization failed: {exc}", file=sys.stderr)
+            return 2
+
     cache_report, topology_vectors = inspect_topology_cache(
         args.cache_dir,
         topo_dim=args.topo_dim,
@@ -558,13 +619,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_abs_value=args.max_cache_abs,
         outlier_z=args.outlier_z,
         max_examples=args.max_examples,
+        active_files=active_files,
     )
     print_cache_report(cache_report)
+
+    replay_vectors = topology_vectors
+    if normalizer is not None:
+        try:
+            normalizer.verify_source_cache()
+            replay_vectors = normalizer.normalize_matrix(topology_vectors)
+        except Exception as exc:
+            print(f"\n[FATAL] Topology normalization failed: {exc}", file=sys.stderr)
+            return 2
 
     try:
         checkpoint_report = inspect_film_checkpoint(
             args.checkpoint,
-            topology_vectors,
+            replay_vectors,
             near_zero_threshold=args.near_zero_threshold,
             max_samples=args.max_film_samples,
         )
@@ -572,6 +643,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"\n[FATAL] Checkpoint inspection failed: {exc}", file=sys.stderr)
         return 2
 
+    checkpoint_report["normalization"] = normalization_label
     print_checkpoint_report(checkpoint_report)
     cache_abnormal = bool(cache_report["errors"])
     checkpoint_abnormal = bool(checkpoint_report["errors"])

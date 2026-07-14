@@ -1,5 +1,6 @@
 import os
 import glob
+import uuid
 import numpy as np
 import torch
 import torch.utils.data
@@ -8,7 +9,6 @@ try:
 except ImportError:
     o3d = None
 import numpy as _np
-import hashlib
 from kitti_odometry_utils import (
     build_odometry_pairs,
     deterministic_sample,
@@ -19,6 +19,13 @@ from kitti_odometry_utils import (
     relative_velodyne_transform,
     transform_points,
 )
+from topology_preprocessing import (
+    TopologyNormalizer,
+    load_topology_cache_file,
+    topology_cache_record_id,
+    validate_cache_version,
+    validate_topology_vector,
+)
 try:
     from .topology import compute_topo_features
 except Exception:
@@ -28,23 +35,44 @@ except Exception:
         compute_topo_features = None
 
 
-def _safe_compute_topo_features(point_cloud, topo_dim, sample_name='sample'):
+def _safe_compute_topo_features(
+    point_cloud,
+    topo_dim,
+    sample_name='sample',
+    strict=False,
+):
     if topo_dim <= 0:
         return np.zeros(1, dtype=np.float32)
 
     if compute_topo_features is None:
+        if strict:
+            raise RuntimeError(
+                f'Topology extraction is unavailable for {sample_name}'
+            )
         return np.zeros(topo_dim, dtype=np.float32)
 
     try:
         topo_feat = compute_topo_features(point_cloud)
-        if topo_feat.shape[0] != topo_dim:
-            print(
+        if np.asarray(topo_feat).shape != (topo_dim,):
+            message = (
                 f"WARNING: Unexpected topology dim for {sample_name}. "
-                f"Expected {topo_dim}, got {topo_feat.shape}"
+                f"Expected ({topo_dim},), got {np.asarray(topo_feat).shape}"
             )
+            if strict:
+                raise ValueError(message.removeprefix('WARNING: '))
+            print(message)
             return np.zeros(topo_dim, dtype=np.float32)
-        return topo_feat.astype(np.float32)
+        topo_feat = validate_topology_vector(topo_feat, topo_dim)
+        if strict and np.all(topo_feat == 0):
+            raise ValueError(
+                f'Topology extraction returned an all-zero vector for {sample_name}'
+            )
+        return topo_feat
     except Exception as exc:
+        if strict:
+            raise RuntimeError(
+                f'Topology extraction failed for {sample_name}: {exc}'
+            ) from exc
         print(f"Topology extraction failed for {sample_name}: {exc}")
         return np.zeros(topo_dim, dtype=np.float32)
 
@@ -99,51 +127,132 @@ def _split_kitti_files(files, split):
 
 
 class _TopologyCacheMixin:
-    def _init_topology_cache(self, cfg, split_name):
+    def _init_topology_cache(self, cfg, split_name, prepare_mode=False):
         self.topo_cache_enabled = bool(self.use_topo and cfg.DATA.TOPO_CACHE_ENABLED)
         self.topo_cache_in_memory = bool(cfg.DATA.TOPO_CACHE_IN_MEMORY)
         self.topo_cache_mem = {}
+        self.topo_cache_files_used = set()
         self.topo_cache_dir = None
+        self.topo_cache_version = validate_cache_version(
+            getattr(cfg.DATA, 'TOPO_CACHE_VERSION', 'v2')
+        )
+
+        if prepare_mode:
+            self.topology_normalizer = TopologyNormalizer(
+                mode='none',
+                topo_dim=int(self.topo_dim),
+                cache_version=self.topo_cache_version,
+                eps=float(getattr(cfg.DATA, 'TOPO_NORM_EPS', 1e-6)),
+            )
+        else:
+            self.topology_normalizer = TopologyNormalizer.from_config(
+                cfg,
+                self.topo_dim,
+                verify_cache_digest=False,
+            )
+        self.strict_topology_computation = bool(
+            prepare_mode or self.topology_normalizer.enabled
+        )
+        self.verify_topology_cache_entries = bool(
+            self.topology_normalizer.enabled
+            and split_name.startswith('train')
+            and not prepare_mode
+        )
 
         if not self.topo_cache_enabled:
+            if self.verify_topology_cache_entries:
+                raise ValueError(
+                    "Train-only z-score normalization requires DATA.TOPO_CACHE_ENABLED=True"
+                )
             return
 
         cache_root = cfg.DATA.TOPO_CACHE_DIR
         if not os.path.isabs(cache_root):
             cache_root = os.path.join(os.path.dirname(__file__), cache_root)
-        self.topo_cache_dir = os.path.join(cache_root, self.__class__.__name__, split_name)
+        self.topo_cache_dir = os.path.join(
+            cache_root,
+            self.__class__.__name__,
+            self.topo_cache_version,
+            split_name,
+        )
         os.makedirs(self.topo_cache_dir, exist_ok=True)
 
-    def _topo_cache_path(self, cache_key):
+    def _topo_cache_path(self, cache_key, point_cloud, topo_dim):
         if self.topo_cache_dir is None:
             return None
-        safe_name = hashlib.md5(cache_key.encode('utf-8')).hexdigest()
+        safe_name = topology_cache_record_id(
+            cache_key,
+            point_cloud,
+            topo_dim,
+            self.topo_cache_version,
+        )
         return os.path.join(self.topo_cache_dir, f'{safe_name}.npy')
+
+    def _normalize_topology(self, topo_feat):
+        return self.topology_normalizer.normalize(topo_feat)
+
+    def _verify_topology_cache_entry(self, cache_path, topo_feat):
+        if self.verify_topology_cache_entries:
+            self.topology_normalizer.verify_cache_entry(
+                cache_path,
+                self.topo_cache_dir,
+                topo_feat,
+            )
 
     def _get_cached_topology(self, cache_key, point_cloud, topo_dim, sample_name):
         if topo_dim <= 0:
             return np.zeros(1, dtype=np.float32)
 
         if not self.topo_cache_enabled:
-            return _safe_compute_topo_features(point_cloud, topo_dim, sample_name)
+            return _safe_compute_topo_features(
+                point_cloud,
+                topo_dim,
+                sample_name,
+                strict=self.strict_topology_computation,
+            )
 
-        if self.topo_cache_in_memory and cache_key in self.topo_cache_mem:
-            return self.topo_cache_mem[cache_key].copy()
+        cache_path = self._topo_cache_path(cache_key, point_cloud, topo_dim)
+        memory_key = cache_path if cache_path is not None else cache_key
+        if self.topo_cache_in_memory and memory_key in self.topo_cache_mem:
+            topo_feat = self.topo_cache_mem[memory_key].copy()
+            if cache_path is not None:
+                self.topo_cache_files_used.add(os.path.abspath(cache_path))
+            self._verify_topology_cache_entry(cache_path, topo_feat)
+            return topo_feat
 
-        cache_path = self._topo_cache_path(cache_key)
         if cache_path is not None and os.path.exists(cache_path):
-            topo_feat = np.load(cache_path).astype(np.float32)
-            if self.topo_cache_in_memory:
-                self.topo_cache_mem[cache_key] = topo_feat
-            return topo_feat.copy()
+            try:
+                topo_feat = load_topology_cache_file(cache_path, topo_dim)
+                if self.strict_topology_computation and np.all(topo_feat == 0):
+                    raise ValueError('all-zero fallback topology vector')
+            except Exception as exc:
+                print(f'WARNING: Rebuilding invalid topology cache {cache_path}: {exc}')
+            else:
+                self.topo_cache_files_used.add(os.path.abspath(cache_path))
+                self._verify_topology_cache_entry(cache_path, topo_feat)
+                if self.topo_cache_in_memory:
+                    self.topo_cache_mem[memory_key] = topo_feat
+                return topo_feat.copy()
 
-        topo_feat = _safe_compute_topo_features(point_cloud, topo_dim, sample_name)
+        topo_feat = _safe_compute_topo_features(
+            point_cloud,
+            topo_dim,
+            sample_name,
+            strict=self.strict_topology_computation,
+        )
+        topo_feat = validate_topology_vector(topo_feat, topo_dim)
         if cache_path is not None:
-            tmp_path = f'{cache_path}.tmp.{os.getpid()}.npy'
-            np.save(tmp_path, topo_feat)
-            os.replace(tmp_path, cache_path)
+            tmp_path = f'{cache_path}.tmp.{os.getpid()}.{uuid.uuid4().hex}.npy'
+            try:
+                np.save(tmp_path, topo_feat)
+                os.replace(tmp_path, cache_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            self.topo_cache_files_used.add(os.path.abspath(cache_path))
+            self._verify_topology_cache_entry(cache_path, topo_feat)
         if self.topo_cache_in_memory:
-            self.topo_cache_mem[cache_key] = topo_feat
+            self.topo_cache_mem[memory_key] = topo_feat
         return topo_feat.copy()
 
 
@@ -158,7 +267,10 @@ class Lung250MDataset(_TopologyCacheMixin, torch.utils.data.Dataset):
         else:
             self.pcd_template = os.path.join(args.cloudfolder_val, 'case_{:03d}_{}.pth')
             self.gt_template = os.path.join(args.supfolder_val, 'case_{:03d}.pth')
-        self.idx_16k = torch.load('ind_16384_train.pth', map_location='cpu')
+        self.idx_16k = torch.load(
+            getattr(args, 'lung_index_file', 'ind_16384_train.pth'),
+            map_location='cpu',
+        )
 
         if split == 'train':
             val_cases = np.array([2, 8, 54, 55, 56, 94, 97])
@@ -175,7 +287,69 @@ class Lung250MDataset(_TopologyCacheMixin, torch.utils.data.Dataset):
         # Check if topology coupling is enabled
         self.use_topo = cfg.MODEL.TOPO_FEAT_DIM > 0
         self.topo_dim = cfg.MODEL.TOPO_FEAT_DIM
-        self._init_topology_cache(cfg, f'{split}_lung')
+        self._init_topology_cache(
+            cfg,
+            f'{split}_lung',
+            prepare_mode=bool(getattr(args, 'prepare_topology_cache', False)),
+        )
+        if self.is_train and self.topology_normalizer.enabled:
+            augmentation_method = str(self.augm_setting.METHOD)
+            if augmentation_method == 'rigid_one' and abs(
+                float(self.augm_setting.MAX_SCALE_OFFSET)
+            ) > self.topology_normalizer.eps:
+                raise ValueError(
+                    "Topology z-score training requires AUGMENTATIONS.MAX_SCALE_OFFSET=0 "
+                    "because cached topology is computed before augmentation"
+                )
+            if augmentation_method == 'multiscale_local_global':
+                raise ValueError(
+                    "Topology z-score training cannot reuse pre-augmentation topology "
+                    "with multiscale_local_global augmentation"
+                )
+
+    def preflight_topology_cache_manifest(self):
+        """Repair invalid train entries, then validate the complete stats manifest."""
+        if not self.verify_topology_cache_entries:
+            return
+
+        expected_count = len(self) * 2
+        stats_count = int(self.topology_normalizer.stats.get('sample_count', 0))
+        if stats_count != expected_count:
+            raise ValueError(
+                f'Topology stats contain {stats_count} samples, but the current '
+                f'training split requires {expected_count}. Run '
+                'prepare_topology_cache.py again.'
+            )
+
+        print(
+            f'Preflighting {expected_count} training topology cache entries '
+            'against the z-score stats manifest'
+        )
+        self.topo_cache_files_used.clear()
+        was_training = self.is_train
+        self.is_train = False
+        try:
+            for index in range(len(self)):
+                self[index]
+        finally:
+            self.is_train = was_training
+
+        cache_root = os.path.abspath(self.topo_cache_dir)
+        active_entries = {
+            os.path.relpath(path, cache_root).replace(os.sep, '/')
+            for path in self.topo_cache_files_used
+        }
+        manifest_entries = set(self.topology_normalizer.entry_digests or {})
+        if active_entries != manifest_entries:
+            missing = sorted(active_entries - manifest_entries)
+            stale = sorted(manifest_entries - active_entries)
+            raise ValueError(
+                'Current training cache identities do not match the topology stats '
+                f'manifest (new={missing[:3]}, stale={stale[:3]}). Run '
+                'prepare_topology_cache.py again.'
+            )
+        self.topology_normalizer.verify_cache_directory(self.topo_cache_dir)
+        print('Training topology cache manifest and digest verified')
 
     def __getitem__(self, idx):
         # load input pcds
@@ -213,6 +387,8 @@ class Lung250MDataset(_TopologyCacheMixin, torch.utils.data.Dataset):
         topo_feat_tgt = self._get_cached_topology(
             f'lung_case_{case:03d}_tgt', pcd_tgt, self.topo_dim, f'lung-tgt-{case}'
         )
+        topo_feat_src = self._normalize_topology(topo_feat_src)
+        topo_feat_tgt = self._normalize_topology(topo_feat_tgt)
 
         if self.is_train:
             if self.augm_setting.METHOD == 'multiscale_local_global':
@@ -346,7 +522,12 @@ class KittiDataset(_TopologyCacheMixin, torch.utils.data.Dataset):
         self.topo_dim = cfg.MODEL.TOPO_FEAT_DIM
         self.norm_factor = cfg.INPUT.SCALE_NORM_FACTOR
         self.augm_setting = cfg.AUGMENTATIONS
-        self._init_topology_cache(cfg, f'{split}_kitti')
+        self.sample_seed = int(getattr(args, 'kitti_seed', 0))
+        self._init_topology_cache(
+            cfg,
+            f'{split}_kitti',
+            prepare_mode=bool(getattr(args, 'prepare_topology_cache', False)),
+        )
 
         if hasattr(args, 'kitti_root') and args.kitti_root:
             self.kitti_root = os.path.abspath(os.path.expanduser(args.kitti_root))
@@ -386,10 +567,15 @@ class KittiDataset(_TopologyCacheMixin, torch.utils.data.Dataset):
     def __getitem__(self, idx):
         file_path = self.file_list[idx]
         pcd = np.fromfile(file_path, dtype=np.float32).reshape(-1, 4)[:, :3]
+        relative_path = os.path.relpath(file_path, self.kitti_root)
 
         if pcd.shape[0] > 16384:
-            permutation = np.random.permutation(pcd.shape[0])
-            pcd = pcd[permutation[:16384]]
+            pcd, _ = deterministic_sample(
+                pcd,
+                16384,
+                f'kitti:{relative_path}',
+                self.sample_seed,
+            )
         else:
             pad = 16384 - pcd.shape[0]
             if pad > 0:
@@ -401,12 +587,13 @@ class KittiDataset(_TopologyCacheMixin, torch.utils.data.Dataset):
         lm_src = pcd_src.copy()
         lm_tgt = pcd_tgt.copy()
 
-        relative_path = os.path.relpath(file_path, self.kitti_root)
         cache_key = f"kitti_{os.path.splitext(relative_path)[0]}"
         topo_feat_src = self._get_cached_topology(
             cache_key, pcd_src, self.topo_dim, os.path.basename(file_path)
         )
         topo_feat_tgt = topo_feat_src.copy()
+        topo_feat_src = self._normalize_topology(topo_feat_src)
+        topo_feat_tgt = self._normalize_topology(topo_feat_tgt)
 
         pcd_base = pcd_src.copy()
         if self.augm_setting.METHOD == 'multiscale_local_global':
@@ -509,7 +696,11 @@ class KittiOdometryDataset(_TopologyCacheMixin, torch.utils.data.Dataset):
         self.odom_root = getattr(args, 'odom_root', 'D:/kitti_odometry')
         self.gap = int(getattr(args, 'odom_gap', 1))
         self._sequence_cache = {}
-        self._init_topology_cache(cfg, f'{split}_kitti_odom')
+        self._init_topology_cache(
+            cfg,
+            f'{split}_kitti_odom',
+            prepare_mode=bool(getattr(args, 'prepare_topology_cache', False)),
+        )
 
         sequence_values = (
             getattr(args, 'odom_train_seqs', None)
@@ -591,6 +782,8 @@ class KittiOdometryDataset(_TopologyCacheMixin, torch.utils.data.Dataset):
             self.topo_dim,
             f'odom-{pair.sequence}-{pair.tgt_idx:06d}-tgt',
         )
+        topo_feat_src = self._normalize_topology(topo_feat_src)
+        topo_feat_tgt = self._normalize_topology(topo_feat_tgt)
         color_src, color_tgt, topo_feat_src, topo_feat_tgt = _compose_input_features(
             pcd_src, pcd_tgt, topo_feat_src, topo_feat_tgt, self.use_topo, self.topo_dim
         )

@@ -16,11 +16,18 @@ from kitti_odometry_utils import (
     transform_points,
     transform_summary,
 )
+from topology_preprocessing import TopologyNormalizer
 
 compute_topo_features = None
 
 
-def prepare_topology_inputs(pcd_src, pcd_tgt, topo_dim, device):
+def prepare_topology_inputs(
+    pcd_src,
+    pcd_tgt,
+    topo_dim,
+    device,
+    topology_normalizer=None,
+):
     color_src = pcd_src
     color_tgt = pcd_tgt
     topo_src = torch.zeros(1, topo_dim, device=device)
@@ -30,6 +37,10 @@ def prepare_topology_inputs(pcd_src, pcd_tgt, topo_dim, device):
         return color_src, color_tgt, topo_src[:, :1], topo_tgt[:, :1]
 
     if compute_topo_features is None:
+        if topology_normalizer is not None and topology_normalizer.enabled:
+            raise RuntimeError(
+                "Topology extraction is unavailable while z-score normalization is enabled"
+            )
         zeros_src = torch.zeros(1, pcd_src.shape[1], topo_dim, device=device)
         zeros_tgt = torch.zeros(1, pcd_tgt.shape[1], topo_dim, device=device)
         return torch.cat([pcd_src, zeros_src], dim=2), torch.cat([pcd_tgt, zeros_tgt], dim=2), topo_src, topo_tgt
@@ -37,9 +48,23 @@ def prepare_topology_inputs(pcd_src, pcd_tgt, topo_dim, device):
     try:
         feat_src = compute_topo_features(pcd_src[0].cpu().numpy())
         feat_tgt = compute_topo_features(pcd_tgt[0].cpu().numpy())
+        if topology_normalizer is not None:
+            if topology_normalizer.enabled and (
+                np.all(np.asarray(feat_src) == 0)
+                or np.all(np.asarray(feat_tgt) == 0)
+            ):
+                raise ValueError(
+                    "Topology extraction returned an all-zero fallback vector"
+                )
+            feat_src = topology_normalizer.normalize(feat_src)
+            feat_tgt = topology_normalizer.normalize(feat_tgt)
         t_feat_src = torch.from_numpy(feat_src).float().to(device)
         t_feat_tgt = torch.from_numpy(feat_tgt).float().to(device)
     except Exception as exc:
+        if topology_normalizer is not None and topology_normalizer.enabled:
+            raise RuntimeError(
+                "Topology extraction/normalization failed during inference"
+            ) from exc
         print(f"Topology extraction failed during inference: {exc}")
         t_feat_src = torch.zeros(topo_dim, device=device)
         t_feat_tgt = torch.zeros(topo_dim, device=device)
@@ -53,7 +78,14 @@ def prepare_topology_inputs(pcd_src, pcd_tgt, topo_dim, device):
     return color_src, color_tgt, topo_src, topo_tgt
 
 
-def run_kitti_odometry_inference(args, cfg, model, device, use_amp):
+def run_kitti_odometry_inference(
+    args,
+    cfg,
+    model,
+    device,
+    use_amp,
+    topology_normalizer,
+):
     pairs = build_odometry_pairs(
         args.odom_root,
         args.seqs,
@@ -87,7 +119,11 @@ def run_kitti_odometry_inference(args, cfg, model, device, use_amp):
         pcd_src = torch.from_numpy((src_np - target_mean) / norm_factor).float().unsqueeze(0).to(device)
         pcd_tgt = torch.from_numpy((tgt_np - target_mean) / norm_factor).float().unsqueeze(0).to(device)
         color_src, color_tgt, topo_src, topo_tgt = prepare_topology_inputs(
-            pcd_src, pcd_tgt, cfg.MODEL.TOPO_FEAT_DIM, device
+            pcd_src,
+            pcd_tgt,
+            cfg.MODEL.TOPO_FEAT_DIM,
+            device,
+            topology_normalizer,
         )
 
         with torch.cuda.amp.autocast(enabled=use_amp):
@@ -150,6 +186,10 @@ def main(args):
     cfg = get_cfg_defaults()
     cfg.merge_from_file(args.config)
     cfg.freeze()
+    topology_normalizer = TopologyNormalizer.from_config(
+        cfg,
+        int(cfg.MODEL.TOPO_FEAT_DIM),
+    )
 
     # computational stuff
     use_amp = cfg.USE_AMP
@@ -171,7 +211,14 @@ def main(args):
         os.makedirs(args.outfile)
 
     if getattr(args, 'dataset', 'lung') == 'kitti_odom':
-        run_kitti_odometry_inference(args, cfg, model, device, use_amp)
+        run_kitti_odometry_inference(
+            args,
+            cfg,
+            model,
+            device,
+            use_amp,
+            topology_normalizer,
+        )
         return
 
     if getattr(args, 'dataset', 'lung') == 'kitti':
@@ -210,7 +257,11 @@ def main(args):
             pcd_src = (pcd_src - mean) / norm_factor
 
             color_src, color_tgt, topo_src, topo_tgt = prepare_topology_inputs(
-                pcd_src, pcd_tgt, cfg.MODEL.TOPO_FEAT_DIM, device
+                pcd_src,
+                pcd_tgt,
+                cfg.MODEL.TOPO_FEAT_DIM,
+                device,
+                topology_normalizer,
             )
 
             with torch.cuda.amp.autocast(enabled=use_amp):
@@ -250,7 +301,11 @@ def main(args):
         pcd_src = (pcd_src - mean) / norm_factor
 
         color_src, color_tgt, topo_src, topo_tgt = prepare_topology_inputs(
-            pcd_src, pcd_tgt, cfg.MODEL.TOPO_FEAT_DIM, device
+            pcd_src,
+            pcd_tgt,
+            cfg.MODEL.TOPO_FEAT_DIM,
+            device,
+            topology_normalizer,
         )
 
         # inference

@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from diagnose_topology_film import inspect_film_checkpoint, inspect_topology_cache, main
+from topology_preprocessing import write_topology_stats
 
 
 class TopologyCacheInspectionTests(unittest.TestCase):
@@ -89,15 +90,49 @@ class FilmCheckpointInspectionTests(unittest.TestCase):
                 )
             checkpoint = root / "model.pth"
             torch.save(state_dict, checkpoint)
+            stats_path = root / "stats.json"
+            write_topology_stats(
+                sorted(cache_dir.glob("*.npy")),
+                cache_dir,
+                stats_path,
+                topo_dim=6,
+                cache_version="v2",
+            )
+            np.save(cache_dir / "orphan.npy", np.full(6, 1000.0, dtype=np.float32))
 
             output = io.StringIO()
             with redirect_stdout(output), redirect_stderr(output):
                 exit_code = main(
-                    ["--cache-dir", str(cache_dir), "--checkpoint", str(checkpoint)]
+                    [
+                        "--cache-dir",
+                        str(cache_dir),
+                        "--stats-file",
+                        str(stats_path),
+                        "--checkpoint",
+                        str(checkpoint),
+                    ]
+                )
+
+            np.save(cache_dir / "0.npy", np.full(6, 99.0, dtype=np.float32))
+            digest_output = io.StringIO()
+            with redirect_stdout(digest_output), redirect_stderr(digest_output):
+                digest_exit_code = main(
+                    [
+                        "--cache-dir",
+                        str(cache_dir),
+                        "--stats-file",
+                        str(stats_path),
+                        "--checkpoint",
+                        str(checkpoint),
+                    ]
                 )
 
         self.assertEqual(exit_code, 0, output.getvalue())
         self.assertIn("Result: OK", output.getvalue())
+        self.assertIn("FiLM replay normalization: zscore", output.getvalue())
+        self.assertIn("orphan_cache_files", output.getvalue())
+        self.assertEqual(digest_exit_code, 2, digest_output.getvalue())
+        self.assertIn("digest", digest_output.getvalue())
 
 
 if __name__ == "__main__":

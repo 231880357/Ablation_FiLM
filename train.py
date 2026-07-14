@@ -101,6 +101,8 @@ def train(cfg, args):
         train_set = KittiOdometryDataset(cfg, args, phase='train', split='train')
     else:
         train_set = Lung250MDataset(cfg, args, phase='train', split='train')
+    if hasattr(train_set, 'preflight_topology_cache_manifest'):
+        train_set.preflight_topology_cache_manifest()
     if args.debug:
         _limit_dataset(train_set, 8)
     if len(train_set) < batch_size:
@@ -318,12 +320,17 @@ if __name__ == "__main__":
                         help='folder containing ground truth (.pth)')
     parser.add_argument('-SVal','--supfolder_val', default='../corrfieldFlowPcdTs', 
                         help='folder containing ground truth (.pth)')
+    parser.add_argument('--lung-index-file', dest='lung_index_file',
+                        default='ind_16384_train.pth',
+                        help='Lung fixed 16k sampling-index checkpoint')
     parser.add_argument('--dataset', default='lung', choices=['lung', 'kitti', 'kitti_odom'],
                         help="dataset to use")
     parser.add_argument('--kitti_root', default='../mmdetection3d/data/kitti/training/velodyne',
                         help="folder containing kitti bin files")
     parser.add_argument('--kitti_sequences', nargs='+', default=None,
                         help='KITTI odometry sequence IDs, for example: 00 01')
+    parser.add_argument('--kitti-seed', dest='kitti_seed', type=int, default=0,
+                        help='base seed for deterministic legacy KITTI sampling')
     parser.add_argument('--odom-root', dest='odom_root', default='D:/kitti_odometry',
                         help='KITTI odometry root containing the official extracted folders')
     parser.add_argument('--odom-train-seqs', dest='odom_train_seqs', default='00,01,02,03,04,05,06,07',
@@ -373,6 +380,8 @@ if __name__ == "__main__":
 
     if args.gpu < 0:
         parser.error('--gpu must be a non-negative physical GPU index')
+    if args.kitti_seed < 0:
+        parser.error('--kitti-seed must be non-negative')
 
     cfg = get_cfg_defaults()
     cfg.merge_from_file(args.config)
