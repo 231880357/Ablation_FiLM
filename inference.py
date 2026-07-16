@@ -65,9 +65,17 @@ def run_kitti_odometry_inference(args, cfg, model, device, use_amp):
     if not pairs:
         raise RuntimeError('No KITTI odometry inference pairs were found')
 
+    pairs_per_sequence = {}
+    for pair in pairs:
+        pairs_per_sequence[pair.sequence] = pairs_per_sequence.get(pair.sequence, 0) + 1
+    coverage = ', '.join(
+        f'{sequence}={count}' for sequence, count in pairs_per_sequence.items()
+    )
+    print(f'KITTI odometry inference coverage: total={len(pairs)}, {coverage}')
+
     sequence_cache = {}
     norm_factor = cfg.INPUT.SCALE_NORM_FACTOR
-    for pair in pairs:
+    for pair_index, pair in enumerate(pairs, start=1):
         src_full = load_velodyne_points(pair.src_bin)
         tgt_full = load_velodyne_points(pair.tgt_bin)
         src_np, _ = deterministic_sample(
@@ -100,17 +108,26 @@ def run_kitti_odometry_inference(args, cfg, model, device, use_amp):
         pred_flow *= norm_factor
         registered_src = src_np + pred_flow
         output_columns = [registered_src, src_np]
+        original_to_target = nearest_neighbor_mean(src_np, tgt_full)
+        target_to_original = nearest_neighbor_mean(tgt_full, src_np)
+        registered_to_target = nearest_neighbor_mean(registered_src, tgt_full)
+        target_to_registered = nearest_neighbor_mean(tgt_full, registered_src)
         metrics = {
             'sequence': pair.sequence,
             'source_frame': pair.src_idx,
             'target_frame': pair.tgt_idx,
             'source_points': int(len(src_np)),
             'target_points': int(len(tgt_np)),
+            'target_full_points': int(len(tgt_full)),
             'pose_available': bool(pair.has_pose),
             'gap': args.gap,
             'sample_seed': args.odom_seed,
-            'original_to_target_nn': nearest_neighbor_mean(src_np, tgt_np),
-            'model_registered_to_target_nn': nearest_neighbor_mean(registered_src, tgt_np),
+            'original_to_target_nn': original_to_target,
+            'target_to_original_nn': target_to_original,
+            'original_chamfer': (original_to_target + target_to_original) / 2.0,
+            'model_registered_to_target_nn': registered_to_target,
+            'target_to_model_registered_nn': target_to_registered,
+            'model_chamfer': (registered_to_target + target_to_registered) / 2.0,
         }
 
         if pair.has_pose:
@@ -130,7 +147,7 @@ def run_kitti_odometry_inference(args, cfg, model, device, use_amp):
                 {
                     'relative_translation': translation,
                     'relative_rotation_degrees': rotation_degrees,
-                    'pose_aligned_to_target_nn': nearest_neighbor_mean(pose_aligned_src, tgt_np),
+                    'pose_aligned_to_target_nn': nearest_neighbor_mean(pose_aligned_src, tgt_full),
                     'model_to_pose_epe': float(
                         np.linalg.norm(registered_src - pose_aligned_src, axis=1).mean()
                     ),
@@ -143,7 +160,7 @@ def run_kitti_odometry_inference(args, cfg, model, device, use_amp):
         np.savetxt(csv_path, np.concatenate(output_columns, axis=1), delimiter=',', fmt='%.6f')
         with open(metrics_path, 'w', encoding='utf-8') as stream:
             json.dump(metrics, stream, indent=2, ensure_ascii=False)
-        print(f'Saved {csv_path}')
+        print(f'[{pair_index}/{len(pairs)}] Saved {csv_path}')
 
 
 def main(args):
@@ -290,8 +307,8 @@ if __name__ == "__main__":
                         help='odometry sequence IDs, for example: --seqs 00 01')
     parser.add_argument('--start', type=int, default=0,
                         help='first source frame position in each sequence')
-    parser.add_argument('--count', type=int, default=20,
-                        help='number of frame pairs per sequence')
+    parser.add_argument('--count', type=int, default=None,
+                        help='optional pair limit per sequence; omitted means all available pairs')
     parser.add_argument('--gap', type=int, default=1,
                         help='frame gap between source and target')
     parser.add_argument('--odom-num-points', dest='odom_num_points', type=int, default=8192,
@@ -306,7 +323,9 @@ if __name__ == "__main__":
     for name in ('start',):
         if getattr(args, name) < 0:
             parser.error(f'--{name} must be non-negative')
-    for name in ('count', 'gap', 'odom_num_points'):
+    if args.count is not None and args.count < 1:
+        parser.error('--count must be at least 1 when provided')
+    for name in ('gap', 'odom_num_points'):
         if getattr(args, name) < 1:
             parser.error(f'--{name.replace("_", "-")} must be at least 1')
 

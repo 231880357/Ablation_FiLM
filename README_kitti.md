@@ -68,6 +68,34 @@ python -X utf8 inference.py `
 
 每个推理 pair 输出一个 CSV 和一个 `.metrics.json`。CSV 前 3 列是模型配准后的 source，接下来 3 列是原始 source；sequence `00-10` 还会追加 3 列 pose-aligned source。
 
+`--count` 只用于限制每个 sequence 的推理 pair 数。正式推理时省略该参数，程序会默认覆盖 `--seqs` 所指定序列从 `--start` 开始的全部合法 pair，并在开始时打印每个 sequence 的实际样本数。例如完整覆盖验证序列 `08-10`：
+
+```bash
+python -X utf8 inference.py \
+  --dataset kitti_odom \
+  --odom-root /path/to/kitti_odometry \
+  --seqs 08 09 10 \
+  --gap 1 \
+  --config config_ppwc_kitti_odom.yaml \
+  --model train_out_kitti_odom/topo9_kitti_odom/model.pth \
+  --outfile prediction_kitti_odom \
+  --gpu 0
+```
+
+每个新生成的 `.metrics.json` 都包含与参考 `evaluate_kitti.py` 一致的对称 Chamfer Distance：source 到完整 target、完整 target 到 source 两个方向的最近邻均值再取平均。运行汇总评估：
+
+```bash
+python -X utf8 evaluate_kitti_odometry.py -o prediction_kitti_odom
+```
+
+控制台输出保持参考脚本的逐样本 `CD` 及 mean/min/25%/50%/75%/max 格式。同时会在预测目录生成：
+
+- `evaluation_summary.json`：总体、逐 sequence 和 KITTI Odometry pose 指标。
+- `evaluation_by_sequence.csv`：逐 sequence 汇总。
+- `evaluation_per_sample.csv`：逐 pair 指标。
+
+sequence `00-10` 有公开 pose，可额外计算 EPE3D、严格/宽松准确率和异常点率；`11-21` 没有公开 pose，只统计 Chamfer 和最近邻指标。旧推理结果的 `.metrics.json` 不包含对称 Chamfer 字段，需要使用更新后的推理脚本重新生成。
+
 ## 旧版 KITTI 输入
 
 训练示例：
@@ -127,4 +155,4 @@ source /root/miniconda3/bin/activate lung_env_1
 python inference.py --config config_ppwc_kitti.yaml --dataset kitti --kitti_root ../mmdetection3d/data/kitti/testing/velodyne -M train_out_kitti/topo9_kitti_rigid/model.pth -O prediction_kitti --gpu 0
 ```
 
-评估可直接复用仓库根目录的 `evaluate_kitti.py`。
+旧版扁平 KITTI 输出仍可使用原先的 `evaluate_kitti.py`；KITTI Odometry 输出使用上文的 `evaluate_kitti_odometry.py`。
